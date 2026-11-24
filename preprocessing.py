@@ -27,7 +27,7 @@ def structural_mri(raw_data):
     """
     pass
 
-def functiononal_mri(raw_data):
+def functional_mri(raw_data):
     """
     Preprocess resting-state functional MRI (fMRI) data from COBRE and
     BrainGluSchi.
