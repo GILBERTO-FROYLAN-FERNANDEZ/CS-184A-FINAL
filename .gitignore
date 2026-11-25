@@ -1,8 +1,8 @@
 # Raw data covered by the COINS data use agreement - never commit
-COBRE data/
-COBRE MR/
-BrainGluSchi data/
-BrainGluSchi MR/
+cobre_clinical/
+cobre_mri/
+braingluschi_clinical/
+braingluschi_mri/
 www.nitrc.org/
 
 # Medical imaging and extracted/derived data

@@ -10,10 +10,10 @@ The per-file details (row, column and subject counts) are in [`data_inventory.cs
 
 | Folder | What it is | Size |
 |---|---|---|
-| `COBRE data/` | Clinical and test CSVs for the COBRE study (prefix `1139_`) | ~1 MB |
-| `BrainGluSchi data/` | Clinical and test CSVs for the BrainGluSchi study (prefix `2079_`) | ~0.6 MB |
-| `COBRE MR/` | 22 zips of raw MRI (DICOM) for COBRE | ~127 GB |
-| `BrainGluSchi MR/` | 12 zips of raw MRI (DICOM) for BrainGluSchi | ~58 GB |
+| `cobre_clinical/` | Clinical and test CSVs for the COBRE study (prefix `1139_`) | ~1 MB |
+| `braingluschi_clinical/` | Clinical and test CSVs for the BrainGluSchi study (prefix `2079_`) | ~0.6 MB |
+| `cobre_mri/` | 22 zips of raw MRI (DICOM) for COBRE | ~127 GB |
+| `braingluschi_mri/` | 12 zips of raw MRI (DICOM) for BrainGluSchi | ~58 GB |
 
 - Both studies come from the Mind Research Network in New Mexico and were scanned on the same scanner model (Siemens 3T Trio).
 - Every file links by the **`Anonymized ID`** column, e.g. `A00000243`. In the MRI zips, the same ID is the subject folder name.
@@ -32,13 +32,13 @@ The label comes from the `Subject Type` column in `*_Demographics_*.csv`.
 | Chronic Sz, Early Sz | BrainGluSchi | schizophrenia |
 | Bipolar, Schizoaffective | both | **dropped** (21 subjects) |
 
-`COBRE data/enrollment_summary.csv` lists which studies each person enrolled in. **104 people appear in both studies' clinical files.** Count them once, and keep each one on a single side of any train/test split.
+`cobre_clinical/enrollment_summary.csv` lists which studies each person enrolled in. **104 people appear in both studies' clinical files.** Count them once, and keep each one on a single side of any train/test split.
 
 ### B. Cognitive tests: tabular model input
 | File | Subjects | Columns |
 |---|---|---|
-| `COBRE data/1139_Cobre_Neuropsych_V2_20261123.csv` | 189 | 111 |
-| `BrainGluSchi data/2079_Neurospsych_20261123.csv` | 175 | 61 |
+| `cobre_clinical/1139_Cobre_Neuropsych_V2_20261123.csv` | 189 | 111 |
+| `braingluschi_clinical/2079_Neurospsych_20261123.csv` | 175 | 61 |
 
 All 61 BrainGluSchi columns also appear in the COBRE file. Use those 61 shared columns when combining the two studies.
 
@@ -84,7 +84,7 @@ BrainGluSchi: human/dicom/triotim/jbustillo/braingluschi_20542/<ID>/<num>_visit1
 2. **Column names can repeat** (e.g. in QOL and Calgary), which breaks PowerShell `Import-Csv`. pandas handles repeats by adding `.1`.
 3. **There can be several rows per person**, one per visit. Use the first visit unless there is a reason not to.
 4. **COBRE files have three extra columns** (`Sub Study Label`, `Days since sub study enrollment`, `Days since first enrollment`). BrainGluSchi files have just `Days since enrollment`.
-5. `COBRE MR/assessment_data.zip` is a copy of `COBRE data/`, so ignore it.
+5. `cobre_mri/assessment_data.zip` is a copy of `cobre_clinical/`, so ignore it.
 6. Leave the MRI zipped. Extract only the T1 and resting-scan folders you need, into a separate working folder.
 
 ## 4. How to load a clinical CSV
@@ -95,8 +95,8 @@ def load(path):
     # Row 1 = readable header, row 2 = coded names (skip it).
     return pd.read_csv(path, header=0, skiprows=[1])
 
-demo = load("COBRE data/1139_Demographics_20261123.csv")
-cog  = load("COBRE data/1139_Cobre_Neuropsych_V2_20261123.csv")
+demo = load("cobre_clinical/1139_Demographics_20261123.csv")
+cog  = load("cobre_clinical/1139_Cobre_Neuropsych_V2_20261123.csv")
 df = cog.merge(demo[["Anonymized ID", "Subject Type", "Current Age", "Gender"]]
                .drop_duplicates("Anonymized ID"), on="Anonymized ID")
 ```

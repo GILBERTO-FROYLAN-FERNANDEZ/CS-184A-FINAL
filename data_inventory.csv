@@ -1,41 +1,41 @@
 folder,file,portion,rows,columns,subjects,used_in_project,description
-COBRE data,1139_Demographics_20261123.csv,labels+demographics,331,30,261,yes,Subject Type (diagnosis label) plus age/sex/education; one row per visit
-COBRE data,enrollment_summary.csv,labels,261,2,261,yes,Which substudies (COBRE / BrainGluSchi) each subject enrolled in; single header row
-COBRE data,1139_Cobre_Neuropsych_V2_20261123.csv,cognition,189,111,189,yes,Cognitive test battery (MCCB-style scores); main tabular input
-COBRE data,1139_PANSS_20261123.csv,patient-only (leakage),191,36,143,exclude,Psychosis symptom ratings - patients only
-COBRE data,1139_CGI_20261123.csv,patient-only (leakage),191,8,145,exclude,Clinician's global illness severity - patients only
-COBRE data,1139_Calgary_20261123.csv,patient-only (leakage),193,15,145,exclude,Depression in schizophrenia scale - patients only
-COBRE data,1139_QOL_20261123.csv,patient-only (leakage),178,80,131,exclude,Quality of life interview - patients only
-COBRE data,1139_UPSA_20261123.csv,patient-only (leakage),95,24,95,exclude,Functional skills assessment - patients only
-COBRE data,1139_Medication_Log_20261123.csv,patient-only (leakage),183,248,135,exclude,Current medications and doses; only for confound checks (dose vs. prediction)
-COBRE data,1139_AIMS_20261123.csv,other (side effects),193,19,145,no,Abnormal involuntary movement scale (medication side effects)
-COBRE data,1139_BAS_20261123.csv,other (side effects),194,10,145,no,Barnes akathisia (restlessness) scale
-COBRE data,1139_SAS_20261123.csv,other (side effects),194,14,145,no,Simpson-Angus extrapyramidal scale
-COBRE data,1139_Neurological_Exam_20261123.csv,other,178,87,178,no,Neurological exam findings
-COBRE data,1139_Medical_History_20261123.csv,other,282,34,246,no,Medical history checklist
-COBRE data,1139_Fagerstrom_COBRE_20261123.csv,other,327,14,261,optional,Smoking/nicotine dependence (possible confound)
-COBRE data,1139_Pre-Scan_Form_20261123.csv,other,1004,13,258,optional,Caffeine/sleep/nicotine before each scan (multiple rows per subject)
-COBRE data,1139_Debriefing_Form_20261123.csv,other,704,39,204,no,Post-task questionnaire (multiple rows per subject)
-COBRE data,1139_SCID_II_Summary_20261123.csv,diagnosis detail (leakage),332,29,258,exclude,Diagnostic interview summary (Axis I/II) - encodes the diagnosis
-COBRE data,1139_Young_Mania_Scale_20261123.csv,other,23,17,23,no,Mania ratings (mostly bipolar subjects)
-BrainGluSchi data,2079_Demographics_20261123.csv,labels+demographics,322,28,250,yes,Subject Type (Old/Young Control; Chronic/Early Sz) plus age/sex
-BrainGluSchi data,2079_Neurospsych_20261123.csv,cognition,175,61,175,yes,Cognitive test battery; every column also exists in the COBRE file
-BrainGluSchi data,2079_PANSS_20261123.csv,patient-only (leakage),185,34,136,exclude,Psychosis symptom ratings - patients only
-BrainGluSchi data,2079_CGI_20261123.csv,patient-only (leakage),178,6,132,exclude,Global illness severity - patients only
-BrainGluSchi data,2079_Calgary_20261123.csv,patient-only (leakage),184,13,136,exclude,Depression in schizophrenia scale - patients only
-BrainGluSchi data,2079_QOL_20261123.csv,patient-only (leakage),173,78,127,exclude,Quality of life interview - patients only
-BrainGluSchi data,2079_Medication_Log_20261123.csv,patient-only (leakage),176,246,128,exclude,Current medications; only for confound checks
-BrainGluSchi data,2079_AIMS_20261123.csv,other (side effects),179,17,131,no,Abnormal involuntary movement scale
-BrainGluSchi data,2079_BAS_20261123.csv,other (side effects),179,8,131,no,Barnes akathisia scale
-BrainGluSchi data,2079_SAS_20261123.csv,other (side effects),179,12,131,no,Simpson-Angus scale
-BrainGluSchi data,2079_Medical_History_20261123.csv,other,257,32,220,no,Medical history checklist
-BrainGluSchi data,2079_Fagerstrom_COBRE_20261123.csv,other,315,12,248,optional,Smoking/nicotine dependence (possible confound)
-BrainGluSchi data,2079_Pre-Scan_Form_20261123.csv,other,629,11,224,optional,Caffeine/sleep/nicotine before each scan
-BrainGluSchi data,2079_SCID_II_Summary_20261123.csv,diagnosis detail (leakage),324,27,250,exclude,Diagnostic interview summary - encodes the diagnosis
-BrainGluSchi data,2079_Schizo-Bipolar_Scale_20261123.csv,other,29,8,29,no,Schizophrenia vs. bipolar rating (few subjects)
-BrainGluSchi data,2079_Young_Mania_Scale_20261123.csv,other,43,15,43,no,Mania ratings
-COBRE MR,scan_data001.zip - scan_data022.zip,MRI,,,198,yes,~127 GB of raw DICOM MRI (T1; resting fMRI; DTI; T2; task fMRI)
-COBRE MR,assessment_data.zip,duplicate,,,,no,Same 19 CSVs as COBRE data/
-COBRE MR,"download.ps1, links.txt, run_download.bat, completed.txt",download helpers,,,,no,Scripts used to download the zips
-BrainGluSchi MR,scan_data001.zip - scan_data012.zip,MRI,,,184,yes,~58 GB of raw DICOM MRI (T1; resting fMRI; DTI; T2)
-BrainGluSchi MR,"download.ps1, links.txt, run_download.bat, completed.txt",download helpers,,,,no,Scripts used to download the zips
+cobre_clinical,1139_Demographics_20261123.csv,labels+demographics,331,30,261,yes,Subject Type (diagnosis label) plus age/sex/education; one row per visit
+cobre_clinical,enrollment_summary.csv,labels,261,2,261,yes,Which substudies (COBRE / BrainGluSchi) each subject enrolled in; single header row
+cobre_clinical,1139_Cobre_Neuropsych_V2_20261123.csv,cognition,189,111,189,yes,Cognitive test battery (MCCB-style scores); main tabular input
+cobre_clinical,1139_PANSS_20261123.csv,patient-only (leakage),191,36,143,exclude,Psychosis symptom ratings - patients only
+cobre_clinical,1139_CGI_20261123.csv,patient-only (leakage),191,8,145,exclude,Clinician's global illness severity - patients only
+cobre_clinical,1139_Calgary_20261123.csv,patient-only (leakage),193,15,145,exclude,Depression in schizophrenia scale - patients only
+cobre_clinical,1139_QOL_20261123.csv,patient-only (leakage),178,80,131,exclude,Quality of life interview - patients only
+cobre_clinical,1139_UPSA_20261123.csv,patient-only (leakage),95,24,95,exclude,Functional skills assessment - patients only
+cobre_clinical,1139_Medication_Log_20261123.csv,patient-only (leakage),183,248,135,exclude,Current medications and doses; only for confound checks (dose vs. prediction)
+cobre_clinical,1139_AIMS_20261123.csv,other (side effects),193,19,145,no,Abnormal involuntary movement scale (medication side effects)
+cobre_clinical,1139_BAS_20261123.csv,other (side effects),194,10,145,no,Barnes akathisia (restlessness) scale
+cobre_clinical,1139_SAS_20261123.csv,other (side effects),194,14,145,no,Simpson-Angus extrapyramidal scale
+cobre_clinical,1139_Neurological_Exam_20261123.csv,other,178,87,178,no,Neurological exam findings
+cobre_clinical,1139_Medical_History_20261123.csv,other,282,34,246,no,Medical history checklist
+cobre_clinical,1139_Fagerstrom_COBRE_20261123.csv,other,327,14,261,optional,Smoking/nicotine dependence (possible confound)
+cobre_clinical,1139_Pre-Scan_Form_20261123.csv,other,1004,13,258,optional,Caffeine/sleep/nicotine before each scan (multiple rows per subject)
+cobre_clinical,1139_Debriefing_Form_20261123.csv,other,704,39,204,no,Post-task questionnaire (multiple rows per subject)
+cobre_clinical,1139_SCID_II_Summary_20261123.csv,diagnosis detail (leakage),332,29,258,exclude,Diagnostic interview summary (Axis I/II) - encodes the diagnosis
+cobre_clinical,1139_Young_Mania_Scale_20261123.csv,other,23,17,23,no,Mania ratings (mostly bipolar subjects)
+braingluschi_clinical,2079_Demographics_20261123.csv,labels+demographics,322,28,250,yes,Subject Type (Old/Young Control; Chronic/Early Sz) plus age/sex
+braingluschi_clinical,2079_Neurospsych_20261123.csv,cognition,175,61,175,yes,Cognitive test battery; every column also exists in the COBRE file
+braingluschi_clinical,2079_PANSS_20261123.csv,patient-only (leakage),185,34,136,exclude,Psychosis symptom ratings - patients only
+braingluschi_clinical,2079_CGI_20261123.csv,patient-only (leakage),178,6,132,exclude,Global illness severity - patients only
+braingluschi_clinical,2079_Calgary_20261123.csv,patient-only (leakage),184,13,136,exclude,Depression in schizophrenia scale - patients only
+braingluschi_clinical,2079_QOL_20261123.csv,patient-only (leakage),173,78,127,exclude,Quality of life interview - patients only
+braingluschi_clinical,2079_Medication_Log_20261123.csv,patient-only (leakage),176,246,128,exclude,Current medications; only for confound checks
+braingluschi_clinical,2079_AIMS_20261123.csv,other (side effects),179,17,131,no,Abnormal involuntary movement scale
+braingluschi_clinical,2079_BAS_20261123.csv,other (side effects),179,8,131,no,Barnes akathisia scale
+braingluschi_clinical,2079_SAS_20261123.csv,other (side effects),179,12,131,no,Simpson-Angus scale
+braingluschi_clinical,2079_Medical_History_20261123.csv,other,257,32,220,no,Medical history checklist
+braingluschi_clinical,2079_Fagerstrom_COBRE_20261123.csv,other,315,12,248,optional,Smoking/nicotine dependence (possible confound)
+braingluschi_clinical,2079_Pre-Scan_Form_20261123.csv,other,629,11,224,optional,Caffeine/sleep/nicotine before each scan
+braingluschi_clinical,2079_SCID_II_Summary_20261123.csv,diagnosis detail (leakage),324,27,250,exclude,Diagnostic interview summary - encodes the diagnosis
+braingluschi_clinical,2079_Schizo-Bipolar_Scale_20261123.csv,other,29,8,29,no,Schizophrenia vs. bipolar rating (few subjects)
+braingluschi_clinical,2079_Young_Mania_Scale_20261123.csv,other,43,15,43,no,Mania ratings
+cobre_mri,scan_data001.zip - scan_data022.zip,MRI,,,198,yes,~127 GB of raw DICOM MRI (T1; resting fMRI; DTI; T2; task fMRI)
+cobre_mri,assessment_data.zip,duplicate,,,,no,Same 19 CSVs as cobre_clinical/
+cobre_mri,"download.ps1, links.txt, run_download.bat, completed.txt",download helpers,,,,no,Scripts used to download the zips
+braingluschi_mri,scan_data001.zip - scan_data012.zip,MRI,,,184,yes,~58 GB of raw DICOM MRI (T1; resting fMRI; DTI; T2)
+braingluschi_mri,"download.ps1, links.txt, run_download.bat, completed.txt",download helpers,,,,no,Scripts used to download the zips
