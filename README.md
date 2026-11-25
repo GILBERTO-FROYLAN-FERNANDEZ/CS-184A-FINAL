@@ -57,15 +57,26 @@ CS-184A-FINAL/
 - **Processing happens on one machine.** The raw MRI stays on that machine, which has the GPU. Only the small feature tables in `data/features/` are shared, through a private Drive folder.
 - **See [`DATA_GUIDE.md`](DATA_GUIDE.md)** for what each file contains, the label mapping, and which forms must never be used as inputs (label leakage).
 
-## Setup _(to be finalized)_
+## Setup
+
+You need **Python 3.11 or 3.12**. Newer versions aren't supported by every package yet.
 
 ```bash
-python -m venv .venv            # Python 3.11 or 3.12 (not 3.14)
-.venv\Scripts\activate          # Windows; use `source .venv/bin/activate` on macOS/Linux
-pip install -r requirements.txt
+# Windows (if you don't have 3.12: `py install 3.12`)
+py -V:3.12 -m venv .venv
+.venv\Scripts\activate
+
+# macOS / Linux
+python3.12 -m venv .venv
+source .venv/bin/activate
+
+pip install -r requirements.txt     # ~3 GB on Windows/Linux (PyTorch with CUDA)
+python src/check_env.py             # should end with "All good."
 ```
 
-Then download the shared feature files into `data/features/`.
+- **GPU:** `requirements.txt` installs PyTorch with CUDA 13.2, which needs a recent NVIDIA driver. With an older driver, see the comment at the top of `requirements.txt`. Without a GPU, the tabular models still run fine on the CPU.
+- **VS Code:** choose `.venv` as the Python interpreter (Ctrl+Shift+P → *Python: Select Interpreter*).
+- **Data:** download the shared feature files into `data/features/` (see [Data](#data)).
 
 ## Pipeline
 

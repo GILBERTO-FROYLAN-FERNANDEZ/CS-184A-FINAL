@@ -1,0 +1,33 @@
+# Python 3.11 or 3.12 (3.13+/3.14 are not yet supported by all of these).
+# Install:  pip install -r requirements.txt
+
+# PyTorch with CUDA 13.2 (works with RTX 50-series GPUs; needs a recent NVIDIA driver).
+# The CUDA build is chosen because its version (2.15.0+cu132) sorts above the CPU-only PyPI build.
+# On macOS, pip finds no wheel on this index and installs the normal PyPI build.
+# Older driver? Swap cu132 for cu128 and pin torch==2.11.0.
+--extra-index-url https://download.pytorch.org/whl/cu132
+torch==2.15.0
+
+# Core data / ML
+numpy>=1.26,<3
+pandas>=2.1
+scipy>=1.11
+scikit-learn>=1.4
+xgboost>=2.0
+shap>=0.45
+pyyaml>=6.0
+tqdm>=4.66
+
+# Tabular Transformer (FT-Transformer)
+rtdl_revisiting_models>=0.0.2
+
+# Neuroimaging
+pydicom>=2.4
+nibabel>=5.2
+nilearn>=0.10.3
+dcm2niix>=1.0.20240202   # DICOM -> NIfTI converter (ships the binary)
+neuroCombat>=0.2.12      # harmonization across the two studies
+
+# Plots and notebooks
+matplotlib>=3.8
+ipykernel>=6.29
