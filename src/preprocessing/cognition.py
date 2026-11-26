@@ -1,30 +1,26 @@
 """
 Preprocess cognitive assessment data from COBRE and BrainGluSchi.
 
-Merge both datasets using their shared neuropsychological features,
-retain each subject's first visit, and prepare the resulting feature
-table for model training.
-
-Missing-value imputation and feature standardization should be fitted
-within each training fold to prevent data leakage.
+Select reviewed neuropsychological features, retain one assessment per
+subject, and export an unimputed, unscaled table for model training.
 
 Flow (offline, no imputation or scaling):
     build_cognition_table
+        load_approved_features
         load_raw_cognition
             load_clinical_csv
-        find_shared_columns
-        select_feature_columns
-            is_non_feature
+                validate_source_ids
+        validate_approved_features
+        load_cognition_manifest            (optional)
         merge_studies
             prepare_study_table
                 retain_first_visit
                     find_visit_order_column
-            coerce_features_numeric
-            resolve_cross_study_duplicates
-                find_cross_study_duplicates
-        make_code_indicators            (on original values, before replacement)
+            select_manifest_cognition_rows (if manifest supplied)
+        coerce_features_numeric
+        make_code_indicators               (before replacement)
         log_code_indicator_rates
-        replace_missing_codes           (9999 and 8888 -> NaN)
+        replace_missing_codes              (9999 and 8888 -> NaN)
         summarize_missingness
         flag_unusable_features
         validate_cognition_table
@@ -34,14 +30,22 @@ Flow (per CV fold, fit on training rows only):
     transform_fold
         make_fold_preprocessor
 
-Separate utility (works on the raw files, counts only):
+Separate utility (works on the raw files, private QC counts):
     profile_cognition_inputs
+
+Changes from the earlier version:
+- Uses the reviewed feature whitelist instead of automatic column selection.
+- Validates IDs and repeated visits, and supports a shared subject manifest.
+- Exports fixed-schema sentinel indicators aligned by subject ID.
+- Validates fold indices and keeps profiling output in a private location.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import re
 from pathlib import Path
 
 import numpy as np
@@ -52,470 +56,755 @@ from sklearn.preprocessing import StandardScaler
 
 log = logging.getLogger(__name__)
 
-# --------------------------------------------------------------------------
-# Constants (verified against the real headers of both neuropsych files)
-# --------------------------------------------------------------------------
 ID_COL = "Anonymized ID"
-STUDY_COL = "study"  # should come from the manifest / enrollment, not the filename
+STUDY_COL = "study"
+SOURCE_STUDY_COL = "source_study"
 
 COBRE_FILE = "1139_Cobre_Neuropsych_V2_20261123.csv"
-BGS_FILE = "2079_Neurospsych_20261123.csv"  # sic
+BGS_FILE = "2079_Neurospsych_20261123.csv"
 
-# Exact names; none of these may ever be a model feature.
+VALID_STUDIES = {"COBRE", "BrainGluSchi"}
+ID_PATTERN = re.compile(r"^A\d{8}$")
+
+# Additional safeguards; the whitelist, not this set, determines features.
 METADATA_COLS = {
-    "Anonymized ID",
-    "Subject Type",                    # diagnosis label
-    "Sub Study Label",                 # COBRE only
-    "Days since sub study enrollment", # COBRE only
-    "Days since first enrollment",     # COBRE only
-    "Days since enrollment",           # BrainGluSchi only
+    ID_COL,
+    "Subject Type",
+    "Sub Study Label",
+    "Days since sub study enrollment",
+    "Days since first enrollment",
+    "Days since enrollment",
     "Visit",
-    "Age", "Gender", "Ethnicity", "Education",  # demographics = confounds
+    "Age",
+    "Gender",
+    "Ethnicity",
+    "Education",
     "Administration Type",
+    STUDY_COL,
+    SOURCE_STUDY_COL,
 }
-VISIT_ORDER_CANDIDATES = ["Days since first enrollment", "Days since enrollment"]
 
-# Missing-value codes (profile of the real files + COBRE data dictionary).
-MISSING_CODES = [9999]      # data dictionary: "Not Applicable". Used instead of blanks
-                            # (~0.5% of feature cells), usually whole tests at a time.
-UNRESOLVED_CODES = [8888]   # NOT in the data dictionary, but common: in the INDI NP sheet 13 of
-                            # 135 subjects (~10%) have at least one. It marks whole tests
-                            # (raw and T-score both 8888), and 8888 in NAB_Mazes carries
-                            # into the derived MATRICS Reasoning/Composite scores. Likely
-                            # "attempted but not completed/invalid", which may be
-                            # informative. Never let it reach a scaler as a number.
-                            # Plan: convert to NaN AND keep a per-test indicator
-                            # (see make_code_indicators); confirm the meaning with the source.
+VISIT_ORDER_CANDIDATES = (
+    "Days since first enrollment",
+    "Days since enrollment",
+)
 
-# Coding from the COBRE data dictionary (CNP_02, CNP_03, CNP_105).
-# BrainGluSchi uses free text instead (m/f; hispanic, caucasian, ...), so these
-# maps are for the confound module, not for the features.
-GENDER_CODES = {1: "Male", 2: "Female"}
-ETHNICITY_CODES = {1: "Caucasian", 2: "African-American", 3: "Hispanic"}
-ADMINISTRATION_TYPE_CODES = {0: "Incorrect", 1: "Correct"}  # a QC flag, not a feature
+MISSING_CODES = (9999,)
+UNRESOLVED_CODES = (8888,)
 
-EXPECTED_N_FEATURES = 52        # score columns present in both files
-EXPECTED_SHARED_BY_NAME = 60    # 52 features + 8 shared metadata columns
-EXPECTED_COBRE_SUBJECTS = 189
-EXPECTED_BGS_SUBJECTS = 175
+EXPECTED_N_FEATURES = 52
 
-# Test groups used for sentinel-code indicators (prefix of the readable column name).
-TEST_GROUP_PREFIXES = [
-    ("WTAR", "WTAR_"), ("TMT_A", "TMT_A_"), ("BACS_SC", "BACS_SC_"),
-    ("HVLT", "HVLT_"), ("WMS-III_SS", "WMS-III_SS_"), ("LNS", "LNS_"),
-    ("NAB_Mazes", "NAB_Mazes_"), ("BVMT", "BVMT_"), ("FAS", "FAS_"),
-    ("Animal_Fluency", "Animal_Fluency_"), ("MSCEIT", "MSCEIT_"), ("CPT-IP", "CPT-IP_"),
-]  # each MatricsDomain_* column is its own group
+TEST_GROUP_PREFIXES = (
+    ("WTAR", "WTAR_"),
+    ("TMT_A", "TMT_A_"),
+    ("BACS_SC", "BACS_SC_"),
+    ("HVLT", "HVLT_"),
+    ("WMS-III_SS", "WMS-III_SS_"),
+    ("LNS", "LNS_"),
+    ("NAB_Mazes", "NAB_Mazes_"),
+    ("BVMT", "BVMT_"),
+    ("FAS", "FAS_"),
+    ("Animal_Fluency", "Animal_Fluency_"),
+    ("MSCEIT", "MSCEIT_"),
+    ("CPT-IP", "CPT-IP_"),
+)
+
+
+def all_missing_codes() -> tuple[int, ...]:
+    return MISSING_CODES + UNRESOLVED_CODES
 
 
 # --------------------------------------------------------------------------
-# Loading
+# Loading and subject IDs
 # --------------------------------------------------------------------------
+def validate_source_ids(df: pd.DataFrame, source: str) -> pd.DataFrame:
+    """Validate every ID before any visit selection can discard a row."""
+    if ID_COL not in df.columns:
+        raise KeyError(f"{source}: missing {ID_COL!r}")
+
+    out = df.copy()
+    out[ID_COL] = out[ID_COL].astype("string").str.strip()
+
+    invalid = out[ID_COL].isna() | ~out[ID_COL].str.fullmatch(
+        ID_PATTERN.pattern
+    ).fillna(False)
+    if invalid.any():
+        raise ValueError(
+            f"{source}: {int(invalid.sum())} null, blank, or malformed IDs"
+        )
+
+    return out
+
+
 def load_clinical_csv(path: Path) -> pd.DataFrame:
-    """Load a clinical CSV with two header rows (names, then codes).
+    """Read readable headers and skip the second, coded-header row."""
+    if not path.is_file():
+        raise FileNotFoundError(path)
 
-    Only blank cells are read as missing, so strings such as "N/A" survive to
-    `coerce_features_numeric`, which reports them instead of hiding them.
-    """
-    df = pd.read_csv(path, header=0, skiprows=[1], keep_default_na=False, na_values=[""])
+    df = pd.read_csv(
+        path,
+        header=0,
+        skiprows=[1],
+        dtype={ID_COL: "string"},
+        keep_default_na=False,
+        na_values=[""],
+    )
     df.columns = df.columns.str.strip()
-    return df
+
+    if df.columns.duplicated().any():
+        duplicates = df.columns[df.columns.duplicated()].tolist()
+        raise ValueError(f"{path.name}: duplicate column names: {duplicates}")
+
+    return validate_source_ids(df, path.name)
 
 
 def load_raw_cognition(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load the raw COBRE and BrainGluSchi neuropsych tables.
-
-    Check that 'Anonymized ID' exists in both and log row, column and
-    unique-ID counts for each.
-    """
+    """Load the two neuropsychological files."""
     cobre = load_clinical_csv(data_dir / "cobre_clinical" / COBRE_FILE)
     bgs = load_clinical_csv(data_dir / "braingluschi_clinical" / BGS_FILE)
+
     for name, df in (("COBRE", cobre), ("BrainGluSchi", bgs)):
-        if ID_COL not in df.columns:
-            raise KeyError(f"{name}: missing '{ID_COL}'. First columns: {list(df.columns[:6])}")
-        log.info("%s: %d rows, %d columns, %d unique IDs",
-                 name, len(df), df.shape[1], df[ID_COL].nunique())
+        log.info(
+            "%s: %d rows, %d columns, %d unique IDs",
+            name,
+            len(df),
+            df.shape[1],
+            df[ID_COL].nunique(),
+        )
+
     return cobre, bgs
 
 
 # --------------------------------------------------------------------------
-# Feature selection
+# Reviewed feature whitelist
 # --------------------------------------------------------------------------
-def is_non_feature(col: str) -> bool:
-    """True if col is in METADATA_COLS (exact-name match, not regex)."""
-    return col in METADATA_COLS
+def is_non_feature(column: str) -> bool:
+    """Check known metadata names; not a substitute for the whitelist."""
+    return column in METADATA_COLS
 
 
-def find_shared_columns(cobre: pd.DataFrame, bgs: pd.DataFrame) -> list[str]:
-    """Columns present in both files, matched on readable name (not code:
-    BrainGluSchi uses NEU_xx, COBRE uses CNP_xx), in BrainGluSchi order.
+def load_approved_features(path: Path) -> list[str]:
+    """Load the reviewed score-column whitelist.
 
-    Expected: 60. 'Days since enrollment' exists only in BrainGluSchi, so the
-    Data Guide's "all 61 also in COBRE" is off by one (harmless: it is metadata).
-    Warn on any other BrainGluSchi column missing from COBRE.
+    The CSV must contain a 'feature' column with the approved names.
+    Additional columns (notes, groupings, ...) are ignored.
     """
-    cobre_cols = set(cobre.columns)
-    missing_in_cobre = [c for c in bgs.columns if c not in cobre_cols]
-    unexpected = [c for c in missing_in_cobre if c != "Days since enrollment"]
-    if unexpected:
-        log.warning("BrainGluSchi columns absent from COBRE: %s", unexpected)
-    shared = [c for c in bgs.columns if c in cobre_cols]
-    if len(shared) != EXPECTED_SHARED_BY_NAME:
-        log.warning("Expected %d shared columns, found %d.", EXPECTED_SHARED_BY_NAME, len(shared))
-    return shared
+    if not path.is_file():
+        raise FileNotFoundError(f"Feature whitelist not found: {path}")
 
+    whitelist = pd.read_csv(path, dtype="string")
 
-def select_feature_columns(
-    shared_columns: list[str], expected_n: int | None = EXPECTED_N_FEATURES
-) -> list[str]:
-    """Remove METADATA_COLS from the shared set.
+    if "feature" not in whitelist.columns:
+        raise ValueError(f"{path}: must contain a 'feature' column")
 
-    Expect EXPECTED_N_FEATURES (52); pass expected_n=None to skip that check.
-    Raise if Age, Gender, Ethnicity, Education, Subject Type or Administration
-    Type survive into the result. Log dropped columns.
-    """
-    features = [c for c in shared_columns if not is_non_feature(c)]
-    dropped = [c for c in shared_columns if is_non_feature(c)]
-    forbidden = {"Age", "Gender", "Ethnicity", "Education", "Subject Type", "Administration Type"}
-    if leaked := forbidden & set(features):
-        raise ValueError(f"Demographic/label columns in features: {sorted(leaked)}")
-    if expected_n is not None and len(features) != expected_n:
-        raise ValueError(f"Expected {expected_n} features, found {len(features)}. "
-                         f"Dropped as metadata: {dropped}")
-    log.info("Shared columns: %d | metadata dropped: %d %s | features: %d",
-             len(shared_columns), len(dropped), dropped, len(features))
+    values = whitelist["feature"].str.strip()
+
+    if values.isna().any() or values.eq("").any():
+        raise ValueError(f"{path}: contains blank feature names")
+
+    features = values.tolist()
+
+    if len(features) != len(set(features)):
+        raise ValueError(f"{path}: contains duplicate feature names")
+
+    if len(features) != EXPECTED_N_FEATURES:
+        raise ValueError(
+            f"{path}: expected {EXPECTED_N_FEATURES} features, found "
+            f"{len(features)}"
+        )
+
+    forbidden = [name for name in features if is_non_feature(name)]
+    if forbidden:
+        raise ValueError(
+            f"{path}: contains known metadata columns: {forbidden}"
+        )
+
     return features
 
 
+def validate_approved_features(
+    cobre: pd.DataFrame,
+    bgs: pd.DataFrame,
+    features: list[str],
+) -> None:
+    """Require every whitelisted feature to occur once in each file."""
+    for name, df in (("COBRE", cobre), ("BrainGluSchi", bgs)):
+        duplicates = df.columns[df.columns.duplicated()].tolist()
+        if duplicates:
+            raise ValueError(f"{name}: duplicate headers: {duplicates}")
+
+        missing = [feature for feature in features if feature not in df]
+        if missing:
+            raise ValueError(
+                f"{name}: approved features absent from file: {missing}"
+            )
+
+    log.info(
+        "Validated %d whitelisted features in both source files",
+        len(features),
+    )
+
+
 # --------------------------------------------------------------------------
-# Visit handling
+# Visit selection and study rows
 # --------------------------------------------------------------------------
 def find_visit_order_column(df: pd.DataFrame) -> str | None:
-    """Return the column that orders visits within a subject, or None.
-
-    Candidates: VISIT_ORDER_CANDIDATES (COBRE has the first, BrainGluSchi the
-    second). Both files also have 'Visit', which is not used for ordering.
-    """
-    for col in VISIT_ORDER_CANDIDATES:
-        if col in df.columns:
-            return col
+    """Return the available enrollment-day column, if any."""
+    for column in VISIT_ORDER_CANDIDATES:
+        if column in df.columns:
+            return column
     return None
 
 
 def retain_first_visit(df: pd.DataFrame) -> pd.DataFrame:
-    """Keep one row per 'Anonymized ID': the earliest visit.
+    """Keep the earliest recorded row per ID; refuse ambiguous repeats.
 
-    Expected to be a no-op: each file has one row per subject (COBRE 189,
-    BrainGluSchi 175) and 'Visit' is constant (COBRE 'n', BrainGluSchi
-    'bsgBaseline'). Warn if any row is dropped, and check that the retained
-    row's 'Visit' is the first visit.
-    If no ordering column exists, fall back to file order and warn.
+    Subjects with a single row are passed through unchanged, even if their
+    visit-order value is missing or nonnumeric. Subjects with multiple rows
+    must have numeric, non-missing visit-order values and a unique minimum.
     """
-    order_col = find_visit_order_column(df)
-    if order_col is None:
-        log.warning("No visit-ordering column found; using first row in file order.")
-        first = df.drop_duplicates(ID_COL, keep="first").copy()
-    else:
-        ordered = df.assign(_order=pd.to_numeric(df[order_col], errors="coerce")).sort_values(
-            [ID_COL, "_order"], na_position="last", kind="stable"
+    if ID_COL not in df.columns:
+        raise KeyError(f"Missing {ID_COL!r}")
+
+    repeated = df[ID_COL].duplicated(keep=False)
+    if not repeated.any():
+        return df.copy()
+
+    order_column = find_visit_order_column(df)
+    if order_column is None:
+        raise ValueError(
+            "Repeated subjects exist, but no visit-order column is available"
         )
-        first = ordered.drop_duplicates(ID_COL, keep="first").drop(columns="_order")
 
-    n_dropped = len(df) - len(first)
-    if n_dropped:
-        log.warning("First-visit filter dropped %d rows (ordered by %s).", n_dropped, order_col)
-    if "Visit" in first.columns and first["Visit"].nunique(dropna=False) > 1:
-        log.warning("Retained rows have several 'Visit' values: %s",
-                    first["Visit"].value_counts(dropna=False).to_dict())
-    return first.sort_index()
+    out = df.copy()
+    out["_visit_order"] = pd.to_numeric(out[order_column], errors="coerce")
+
+    if out.loc[repeated, "_visit_order"].isna().any():
+        raise ValueError(
+            "Repeated subjects have missing or nonnumeric visit-order values"
+        )
+
+    repeated_rows = out[repeated]
+    unique_rows = out[~repeated]
+
+    earliest_day = repeated_rows.groupby(ID_COL)["_visit_order"].transform(
+        "min"
+    )
+    earliest = repeated_rows.loc[
+        repeated_rows["_visit_order"].eq(earliest_day)
+    ]
+
+    if earliest[ID_COL].duplicated().any():
+        raise ValueError(
+            "Some subjects have multiple rows tied for their earliest visit"
+        )
+
+    combined = pd.concat([unique_rows, earliest])
+    dropped = len(df) - len(combined)
+    if dropped:
+        log.info(
+            "First-visit selection dropped %d later rows using %s",
+            dropped,
+            order_column,
+        )
+
+    return combined.drop(columns="_visit_order").sort_index()
 
 
-# --------------------------------------------------------------------------
-# Merging
-# --------------------------------------------------------------------------
-def prepare_study_table(df: pd.DataFrame, study: str, feature_cols: list[str]) -> pd.DataFrame:
-    """First visit only; columns restricted to ID + features; add 'study' column."""
+def prepare_study_table(
+    df: pd.DataFrame,
+    source_study: str,
+    feature_cols: list[str],
+) -> pd.DataFrame:
+    """Select ID and scores from one source after visit selection."""
+    if source_study not in VALID_STUDIES:
+        raise ValueError(f"Unknown study: {source_study}")
+
     first = retain_first_visit(df)
-    out = first[[ID_COL] + feature_cols].copy()
-    out.insert(1, STUDY_COL, study)
-    return out
+    selected = first[[ID_COL] + feature_cols].copy()
+    selected[SOURCE_STUDY_COL] = source_study
+    return selected
 
 
-def coerce_features_numeric(df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
-    """Convert features to numeric and warn about values that became NaN."""
-    out = df.copy()
-    for col in feature_cols:
-        converted = pd.to_numeric(out[col], errors="coerce")
-        newly_nan = int(converted.isna().sum() - out[col].isna().sum())
-        if newly_nan:
-            bad = out.loc[converted.isna() & out[col].notna(), col].astype(str)
-            log.warning("Column '%s': %d non-numeric values became NaN (e.g. %s)",
-                        col, newly_nan, bad.unique()[:3].tolist())
-        out[col] = converted.astype(float)
-    return out
+# --------------------------------------------------------------------------
+# Optional shared-manifest integration
+# --------------------------------------------------------------------------
+def load_cognition_manifest(path: Path) -> pd.DataFrame:
+    """Load a private manifest shared with the MRI pipelines.
+
+    Required columns:
+      'Anonymized ID': one row per subject
+      'eligible': true/false or 1/0
+      'study': canonical study assignment
+      'cognition_source_study': clinical file supplying cognition scores
+    """
+    required = {ID_COL, "eligible", STUDY_COL, "cognition_source_study"}
+
+    manifest = pd.read_csv(path, dtype={ID_COL: "string"})
+    missing = required - set(manifest.columns)
+    if missing:
+        raise ValueError(f"Manifest missing columns: {sorted(missing)}")
+
+    manifest = validate_source_ids(manifest, "manifest")
+
+    if manifest[ID_COL].duplicated().any():
+        raise ValueError("Manifest contains duplicate subject IDs")
+
+    eligibility = (
+        manifest["eligible"].astype("string").str.strip().str.lower()
+    )
+    mapping = {"true": True, "false": False, "1": True, "0": False}
+
+    if not eligibility.isin(mapping).all():
+        raise ValueError(
+            "Manifest 'eligible' must contain only true/false or 1/0"
+        )
+
+    manifest["eligible"] = eligibility.map(mapping).astype(bool)
+    eligible = manifest.loc[manifest["eligible"]]
+
+    for column in (STUDY_COL, "cognition_source_study"):
+        if eligible[column].isna().any():
+            raise ValueError(f"Eligible subjects have missing {column}")
+        if not eligible[column].isin(VALID_STUDIES).all():
+            raise ValueError(f"Eligible subjects have invalid {column}")
+
+    return manifest
 
 
-def _all_codes() -> list[int]:
-    return list(MISSING_CODES) + list(UNRESOLVED_CODES)
-
-
-def replace_missing_codes(
-    df: pd.DataFrame, feature_cols: list[str], codes: list[int] | None = None
+def select_manifest_cognition_rows(
+    stacked: pd.DataFrame,
+    manifest: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Replace sentinel codes with NaN in feature columns, before anything else
-    touches the values (scaling a 9999 or 8888 would wreck a column).
+    """Select eligible rows from the source specified by the shared manifest."""
+    if stacked.duplicated([ID_COL, SOURCE_STUDY_COL]).any():
+        raise ValueError("Duplicate cognition rows within a source study")
 
-    `codes` defaults to MISSING_CODES + UNRESOLVED_CODES, so no raw sentinel
-    survives into the exported table. Log the cells replaced per column, code
-    and study. Call make_code_indicators on the ORIGINAL values first so the
-    distinction between 8888 and 9999 is not lost.
-    """
-    codes = _all_codes() if codes is None else list(codes)
-    out = df.copy()
-    for code in codes:
-        mask = out[feature_cols] == code
-        n_cells = int(mask.to_numpy().sum())
-        if not n_cells:
-            continue
-        by_study = mask.any(axis=1).groupby(out[STUDY_COL]).sum().astype(int).to_dict()
-        per_col = mask.sum()
-        log.info("Code %s: %d cells in %d columns; subjects affected by study: %s",
-                 code, n_cells, int((per_col > 0).sum()), by_study)
-        out[feature_cols] = out[feature_cols].mask(mask)
-    return out
+    joined = stacked.merge(
+        manifest[[ID_COL, "eligible", STUDY_COL, "cognition_source_study"]],
+        on=ID_COL,
+        how="left",
+        validate="many_to_one",
+        indicator=True,
+    )
 
+    absent = joined["_merge"].eq("left_only")
+    if absent.any():
+        raise ValueError(
+            f"{joined.loc[absent, ID_COL].nunique()} cognition IDs "
+            "are absent from the manifest"
+        )
 
-def _group_of(col: str) -> str:
-    """Test group of a feature column (see TEST_GROUP_PREFIXES)."""
-    if col.startswith("MatricsDomain_"):
-        return col.replace("_T-Score", "")
-    for group, prefix in TEST_GROUP_PREFIXES:
-        if col.startswith(prefix):
-            return group
-    return col  # unknown test: its own group
+    joined = joined.drop(columns="_merge")
+    selected = joined.loc[
+        joined["eligible"]
+        & joined[SOURCE_STUDY_COL].eq(joined["cognition_source_study"])
+    ].copy()
 
+    if selected[ID_COL].duplicated().any():
+        raise ValueError(
+            "Manifest selection produced duplicate cognition IDs"
+        )
 
-def make_code_indicators(df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
-    """Binary flags, one per test group and code, computed before replacement.
+    expected = set(manifest.loc[manifest["eligible"], ID_COL])
+    unavailable = expected - set(selected[ID_COL])
+    if unavailable:
+        log.warning(
+            "%d eligible manifest subjects have no cognition row in "
+            "their designated source",
+            len(unavailable),
+        )
 
-    Groups (by column prefix): WTAR, TMT_A, BACS_SC, HVLT, WMS-III_SS, LNS,
-    NAB_Mazes, BVMT, FAS, Animal_Fluency, MSCEIT, CPT-IP, MATRICS domains.
-    Output columns like 'TMT_A__code8888', 'CPT-IP__code9999'. Constant (all-0)
-    flags are dropped. They use only the raw values (no labels, no cross-subject
-    statistics), so computing them offline cannot leak.
-
-    How well the flags predict diagnosis needs labels, so that check belongs in
-    the evaluation module, not here.
-    """
-    groups: dict[str, list[str]] = {}
-    for col in feature_cols:
-        groups.setdefault(_group_of(col), []).append(col)
-
-    flags = {}
-    for group, cols in groups.items():
-        for code in _all_codes():
-            flag = (df[cols] == code).any(axis=1).astype(int)
-            if flag.any():
-                flags[f"{group}__code{code}"] = flag
-    return pd.DataFrame(flags, index=df.index)
-
-
-def log_code_indicator_rates(indicators: pd.DataFrame, study: pd.Series) -> pd.DataFrame:
-    """Log and return the share of subjects with each flag, per study (percent)."""
-    if indicators.empty:
-        log.info("No sentinel-code indicators were triggered.")
-        return pd.DataFrame()
-    rates = indicators.groupby(study).mean().T * 100
-    log.info("Sentinel-code rates (%% of subjects) by study:\n%s", rates.round(1).to_string())
-    return rates
-
-
-def find_cross_study_duplicates(df: pd.DataFrame) -> list[str]:
-    """IDs that appear in both studies' cognition files.
-
-    Profile result: 0. Keep as an assertion/safeguard.
-    """
-    n_studies = df.groupby(ID_COL)[STUDY_COL].nunique()
-    return n_studies[n_studies > 1].index.tolist()
-
-
-def resolve_cross_study_duplicates(
-    df: pd.DataFrame, feature_cols: list[str], policy: str = "fewest_missing"
-) -> pd.DataFrame:
-    """Reduce people present in both studies to a single row.
-
-    Expected to be a no-op: the profile found no ID in both neuropsych files.
-
-    PLACEHOLDER: the final rule should come from the master manifest
-    (src/data/) so all three modalities agree.
-    Policies: 'fewest_missing', 'prefer_cobre', 'prefer_braingluschi'.
-    """
-    dup_ids = find_cross_study_duplicates(df)
-    if not dup_ids:
-        return df
-    log.warning("%d subjects appear in both studies; resolving with policy '%s'",
-                len(dup_ids), policy)
-
-    def rank(frame: pd.DataFrame) -> pd.Series:
-        if policy == "fewest_missing":
-            unobserved = frame[feature_cols].isna() | frame[feature_cols].isin(_all_codes())
-            return unobserved.sum(axis=1)
-        if policy == "prefer_cobre":
-            return (frame[STUDY_COL] != "COBRE").astype(int)
-        if policy == "prefer_braingluschi":
-            return (frame[STUDY_COL] != "BrainGluSchi").astype(int)
-        raise ValueError(f"Unknown policy: {policy}")
-
-    ranked = df.assign(_rank=rank(df)).sort_values([ID_COL, "_rank"], kind="stable")
-    return ranked.drop_duplicates(ID_COL, keep="first").drop(columns="_rank")
+    return (
+        selected.drop(columns=["eligible", "cognition_source_study"])
+        .sort_values(ID_COL)
+        .reset_index(drop=True)
+    )
 
 
 def merge_studies(
     cobre: pd.DataFrame,
     bgs: pd.DataFrame,
     feature_cols: list[str],
-    dedup_policy: str = "fewest_missing",
+    manifest: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Stack both studies on the shared features; one row per person.
+    """Stack cognition rows, using a manifest if one is supplied.
 
-    Sentinel codes are still present in the result (see replace_missing_codes).
+    Without a manifest, source study is used provisionally as canonical
+    study. That is acceptable for exporting cognition but does not
+    establish cross-modal eligibility or canonical study assignment.
     """
     stacked = pd.concat(
-        [prepare_study_table(cobre, "COBRE", feature_cols),
-         prepare_study_table(bgs, "BrainGluSchi", feature_cols)],
+        [
+            prepare_study_table(cobre, "COBRE", feature_cols),
+            prepare_study_table(bgs, "BrainGluSchi", feature_cols),
+        ],
         ignore_index=True,
     )
-    stacked = coerce_features_numeric(stacked, feature_cols)
-    merged = resolve_cross_study_duplicates(stacked, feature_cols, dedup_policy)
-    return merged.sort_values(ID_COL).reset_index(drop=True)
+
+    if manifest is not None:
+        return select_manifest_cognition_rows(stacked, manifest)
+
+    if stacked[ID_COL].duplicated().any():
+        raise ValueError(
+            "An ID occurs in both cognition files. Supply a shared "
+            "--manifest; cognition.py must not choose a source independently."
+        )
+
+    log.warning(
+        "No manifest supplied: exporting all cognition subjects. Cohort "
+        "eligibility and canonical study must be checked downstream."
+    )
+
+    stacked[STUDY_COL] = stacked[SOURCE_STUDY_COL]
+    return stacked.sort_values(ID_COL).reset_index(drop=True)
 
 
 # --------------------------------------------------------------------------
-# Quality checks
+# Numeric values and sentinel codes
+# --------------------------------------------------------------------------
+def coerce_features_numeric(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+) -> pd.DataFrame:
+    """Convert reviewed score columns to numbers; reject unexpected text."""
+    out = df.copy()
+
+    for column in feature_cols:
+        raw = out[column]
+        converted = pd.to_numeric(raw, errors="coerce")
+
+        unexpected = raw.notna() & converted.isna()
+        if unexpected.any():
+            examples = (
+                raw.loc[unexpected].astype(str).unique()[:3].tolist()
+            )
+            raise ValueError(
+                f"{column}: {int(unexpected.sum())} unexpected nonnumeric "
+                f"values (e.g. {examples}); review the source data locally"
+            )
+
+        converted = converted.astype(float)
+        if np.isinf(converted.to_numpy()).any():
+            raise ValueError(f"{column}: infinite values present")
+
+        out[column] = converted
+
+    return out
+
+
+def group_of(column: str) -> str:
+    """Return a fixed test-group name for an approved score column."""
+    if column.startswith("MatricsDomain_"):
+        return column.removesuffix("_T-Score")
+
+    for group, prefix in TEST_GROUP_PREFIXES:
+        if column.startswith(prefix):
+            return group
+
+    raise ValueError(
+        f"Approved feature has no reviewed test-group mapping: {column}"
+    )
+
+
+def make_code_indicators(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+) -> pd.DataFrame:
+    """Return ID-keyed sentinel flags with a schema independent of values.
+
+    Compute on original numeric scores, before sentinel replacement.
+    Build via a dict of arrays so the DataFrame is constructed in a
+    single step and does not trigger pandas fragmentation.
+    """
+    groups: dict[str, list[str]] = {}
+    for column in feature_cols:
+        groups.setdefault(group_of(column), []).append(column)
+
+    flag_arrays: dict[str, np.ndarray] = {}
+    for group, columns in groups.items():
+        for code in all_missing_codes():
+            name = f"{group}__code{code}"
+            flag_arrays[name] = (
+                df[columns].eq(code).any(axis=1).to_numpy().astype("int8")
+            )
+
+    flags = pd.DataFrame(flag_arrays)
+    flags.insert(0, ID_COL, df[ID_COL].to_numpy())
+    return flags
+
+
+def log_code_indicator_rates(
+    indicators: pd.DataFrame,
+    study: pd.Series,
+) -> pd.DataFrame:
+    """Log per-study rates; return the full (possibly sparse) rate table."""
+    flag_columns = indicators.columns.drop(ID_COL)
+    rates = (
+        indicators[flag_columns]
+        .groupby(study.to_numpy())
+        .mean()
+        .T
+        * 100
+    )
+
+    nonzero = rates.loc[rates.sum(axis=1) > 0]
+    if nonzero.empty:
+        log.info("No sentinel-code indicators triggered.")
+    else:
+        log.info(
+            "Sentinel-code rates (%% of subjects, nonzero rows):\n%s",
+            nonzero.round(1).to_string(),
+        )
+
+    return rates
+
+
+def replace_missing_codes(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    codes: tuple[int, ...] | None = None,
+) -> pd.DataFrame:
+    """Replace approved sentinel codes with NaN in score columns only."""
+    codes = all_missing_codes() if codes is None else codes
+    out = df.copy()
+
+    for code in codes:
+        mask = out[feature_cols].eq(code)
+        count = int(mask.to_numpy().sum())
+        if not count:
+            continue
+
+        by_study = (
+            mask.any(axis=1)
+            .groupby(out[STUDY_COL])
+            .sum()
+            .astype(int)
+            .to_dict()
+        )
+        log.info(
+            "Code %s: %d cells; subjects affected by study: %s",
+            code,
+            count,
+            by_study,
+        )
+        out[feature_cols] = out[feature_cols].mask(mask)
+
+    return out
+
+
+# --------------------------------------------------------------------------
+# Quality checks and export
 # --------------------------------------------------------------------------
 def summarize_missingness(
-    df: pd.DataFrame, feature_cols: list[str]
+    df: pd.DataFrame,
+    feature_cols: list[str],
 ) -> dict[str, pd.DataFrame | pd.Series]:
-    """Descriptive missingness: per feature, per subject, per study.
-
-    Must not modify the data.
-    """
+    """Descriptive summaries; do not modify the input."""
     missing = df[feature_cols].isna()
-    per_feature = pd.DataFrame({
-        "n_missing": missing.sum(),
-        "pct_missing": missing.mean() * 100,
-    }).sort_values("pct_missing", ascending=False)
-    per_subject = missing.mean(axis=1) * 100
-    per_study = missing.groupby(df[STUDY_COL]).mean().T * 100
-    return {"per_feature": per_feature, "per_subject": per_subject, "per_study": per_study}
+
+    per_feature = pd.DataFrame(
+        {
+            "n_missing": missing.sum(),
+            "pct_missing": missing.mean() * 100,
+        }
+    ).sort_values("pct_missing", ascending=False)
+
+    return {
+        "per_feature": per_feature,
+        "per_subject": missing.mean(axis=1) * 100,
+        "per_study": missing.groupby(df[STUDY_COL]).mean().T * 100,
+    }
 
 
 def flag_unusable_features(
-    df: pd.DataFrame, feature_cols: list[str], max_missing_pct: float = 50.0
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    max_missing_pct: float = 50.0,
 ) -> list[str]:
-    """Report (do not drop) features that are constant or mostly missing."""
+    """Report features to investigate; do not select or drop them here."""
     flagged = [
-        col for col in feature_cols
-        if df[col].isna().mean() * 100 > max_missing_pct or df[col].nunique(dropna=True) <= 1
+        column
+        for column in feature_cols
+        if (
+            df[column].isna().mean() * 100 > max_missing_pct
+            or df[column].nunique(dropna=True) <= 1
+        )
     ]
+
     if flagged:
-        log.warning("Flagged features (constant or >%.0f%% missing): %s", max_missing_pct, flagged)
+        log.warning("Features needing review: %s", flagged)
+
     return flagged
 
 
-def validate_cognition_table(df: pd.DataFrame, feature_cols: list[str]) -> None:
-    """Raise on: null or duplicate IDs, non-numeric features, unexpected
-    study labels, or entirely-missing features."""
-    if absent := [c for c in feature_cols if c not in df.columns]:
-        raise KeyError(f"Feature columns missing from table: {absent}")
-    if metadata := [c for c in feature_cols if is_non_feature(c)]:
-        raise ValueError(f"Metadata columns listed as features: {metadata}")
-    if df[ID_COL].isna().any():
-        raise ValueError("Null subject IDs present.")
+def validate_cognition_table(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+) -> None:
+    """Validate the unimputed, unscaled subject-level score table."""
+    if df.empty:
+        raise ValueError("Cognition table is empty")
+
+    missing = [column for column in feature_cols if column not in df]
+    if missing:
+        raise KeyError(f"Missing approved features: {missing}")
+
+    for required in (STUDY_COL, SOURCE_STUDY_COL):
+        if required not in df.columns:
+            raise KeyError(f"Missing required column: {required}")
+
+    validate_source_ids(df, "cognition output")
+
     if df[ID_COL].duplicated().any():
-        raise ValueError("Duplicate subject IDs after first-visit/dedup step.")
-    if df[feature_cols].select_dtypes(exclude="number").shape[1]:
-        raise TypeError("Non-numeric feature columns remain.")
-    if not set(df[STUDY_COL]).issubset({"COBRE", "BrainGluSchi"}):
-        raise ValueError(f"Unexpected study labels: {df[STUDY_COL].unique()}")
-    if leftovers := [c for c in feature_cols if df[c].isin(_all_codes()).any()]:
-        raise ValueError(f"Sentinel codes remain in: {leftovers}")
-    if all_missing := [c for c in feature_cols if df[c].isna().all()]:
-        raise ValueError(f"Entirely-missing features: {all_missing}")
-    log.info("Validation passed: %d subjects x %d features", len(df), len(feature_cols))
+        raise ValueError("Duplicate cognition IDs")
+
+    for column in (STUDY_COL, SOURCE_STUDY_COL):
+        if df[column].isna().any():
+            raise ValueError(f"Missing values in {column}")
+        if not df[column].isin(VALID_STUDIES).all():
+            raise ValueError(f"Unexpected values in {column}")
+
+    nonnumeric = df[feature_cols].select_dtypes(exclude="number").columns
+    if len(nonnumeric):
+        raise TypeError(
+            f"Nonnumeric cognitive features remain: {list(nonnumeric)}"
+        )
+
+    values = df[feature_cols].to_numpy(dtype=float)
+    if np.isinf(values).any():
+        raise ValueError("Infinite cognitive values remain")
+
+    remaining_codes = [
+        column
+        for column in feature_cols
+        if df[column].isin(all_missing_codes()).any()
+    ]
+    if remaining_codes:
+        raise ValueError(f"Sentinel codes remain in: {remaining_codes}")
+
+    all_missing = [
+        column for column in feature_cols if df[column].isna().all()
+    ]
+    if all_missing:
+        raise ValueError(
+            f"Entirely missing cognitive features: {all_missing}"
+        )
+
+    log.info(
+        "Validation passed: %d subjects x %d features",
+        len(df),
+        len(feature_cols),
+    )
 
 
-# --------------------------------------------------------------------------
-# Export
-# --------------------------------------------------------------------------
 def export_cognition_table(
     df: pd.DataFrame,
     feature_cols: list[str],
     out_dir: Path,
-    indicators: pd.DataFrame | None = None,
+    indicators: pd.DataFrame,
 ) -> None:
-    """Write cognition.csv (ID + features), cognition_study.csv (ID + study),
-    cognition_features.csv (feature names) and, if given, cognition_indicators.csv
-    (ID + sentinel-code flags).
+    """Export private, ID-keyed feature tables; never export labels here."""
+    if indicators[ID_COL].duplicated().any():
+        raise ValueError("Duplicate IDs in indicator table")
 
-    No labels or demographics are written; join them from labels.csv
-    on 'Anonymized ID'.
-    """
+    if set(indicators[ID_COL]) != set(df[ID_COL]):
+        raise ValueError(
+            "Indicator IDs do not match cognition table IDs"
+        )
+
+    flags = df[[ID_COL]].merge(
+        indicators,
+        on=ID_COL,
+        how="left",
+        validate="one_to_one",
+    )
+
+    flag_columns = flags.columns.drop(ID_COL)
+    if flags[flag_columns].isna().any().any():
+        raise ValueError("Indicator alignment introduced missing flags")
+
     out_dir.mkdir(parents=True, exist_ok=True)
-    df[[ID_COL] + feature_cols].to_csv(out_dir / "cognition.csv", index=False)
-    df[[ID_COL, STUDY_COL]].to_csv(out_dir / "cognition_study.csv", index=False)
-    pd.Series(feature_cols, name="feature").to_csv(out_dir / "cognition_features.csv", index=False)
-    if indicators is not None and not indicators.empty:
-        pd.concat([df[[ID_COL]], indicators], axis=1).to_csv(
-            out_dir / "cognition_indicators.csv", index=False)
+
+    df[[ID_COL] + feature_cols].to_csv(
+        out_dir / "cognition.csv", index=False
+    )
+    df[[ID_COL, STUDY_COL, SOURCE_STUDY_COL]].to_csv(
+        out_dir / "cognition_study.csv", index=False
+    )
+    pd.DataFrame({"feature": feature_cols}).to_csv(
+        out_dir / "cognition_features.csv", index=False
+    )
+    flags.to_csv(out_dir / "cognition_indicators.csv", index=False)
+
     log.info("Exported cognition tables to %s", out_dir)
 
 
 # --------------------------------------------------------------------------
-# Offline pipeline (no imputation or scaling)
+# Offline pipeline
 # --------------------------------------------------------------------------
 def build_cognition_table(
-    data_dir: Path, out_dir: Path, dedup_policy: str = "fewest_missing"
+    data_dir: Path,
+    out_dir: Path,
+    approved_features_path: Path | None = None,
+    manifest_path: Path | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
-    """Raw CSVs -> validated, unimputed, unscaled subject-level feature table.
+    """Build and export approved cognitive scores without fitting a model."""
+    if approved_features_path is None:
+        approved_features_path = data_dir / "whitelisted-features.csv"
 
-    Sentinel codes (9999, 8888) become NaN; per-test indicator flags preserve
-    where they occurred. Everything data-dependent (imputation, scaling) is
-    left to `transform_fold`.
-    """
+    feature_cols = load_approved_features(approved_features_path)
     cobre, bgs = load_raw_cognition(data_dir)
-    feature_cols = select_feature_columns(find_shared_columns(cobre, bgs))
-    table = merge_studies(cobre, bgs, feature_cols, dedup_policy)
+    validate_approved_features(cobre, bgs, feature_cols)
 
-    counts = table[STUDY_COL].value_counts().to_dict()
-    for study, expected in (("COBRE", EXPECTED_COBRE_SUBJECTS), ("BrainGluSchi", EXPECTED_BGS_SUBJECTS)):
-        if counts.get(study) != expected:
-            log.warning("%s: expected %d subjects, found %s", study, expected, counts.get(study))
+    manifest = (
+        load_cognition_manifest(manifest_path)
+        if manifest_path is not None
+        else None
+    )
 
-    indicators = make_code_indicators(table, feature_cols)   # must precede replacement
+    table = merge_studies(cobre, bgs, feature_cols, manifest)
+    table = coerce_features_numeric(table, feature_cols)
+
+    log.info(
+        "Cognition rows by source study: %s",
+        table[SOURCE_STUDY_COL].value_counts().to_dict(),
+    )
+
+    indicators = make_code_indicators(table, feature_cols)
     log_code_indicator_rates(indicators, table[STUDY_COL])
-    table = replace_missing_codes(table, feature_cols)
 
+    table = replace_missing_codes(table, feature_cols)
     missingness = summarize_missingness(table, feature_cols)
-    log.info("Overall missing after code replacement: %.2f%%",
-             table[feature_cols].isna().mean().mean() * 100)
+
+    log.info(
+        "Overall missing after code replacement: %.2f%%",
+        table[feature_cols].isna().mean().mean() * 100,
+    )
+
     flag_unusable_features(table, feature_cols)
     validate_cognition_table(table, feature_cols)
 
     export_cognition_table(table, feature_cols, out_dir, indicators)
-    missingness["per_feature"].to_csv(out_dir / "cognition_missingness.csv")  # aggregate only
+    missingness["per_feature"].to_csv(out_dir / "cognition_missingness.csv")
+
     return table, feature_cols
 
 
 # --------------------------------------------------------------------------
-# Fold-level preprocessing (fit on training rows only)
+# Fold-level preprocessing
 # --------------------------------------------------------------------------
 def make_fold_preprocessor(strategy: str = "median") -> Pipeline:
-    """Return a fresh, unfitted imputer + scaler pipeline for one fold."""
-    return Pipeline([
-        ("impute", SimpleImputer(strategy=strategy, keep_empty_features=True)),
-        ("scale", StandardScaler()),
-    ])
+    """Return a new, unfitted preprocessing pipeline for one fold."""
+    return Pipeline(
+        [
+            (
+                "impute",
+                SimpleImputer(strategy=strategy, keep_empty_features=True),
+            ),
+            ("scale", StandardScaler()),
+        ]
+    )
 
 
 def transform_fold(
@@ -524,137 +813,93 @@ def transform_fold(
     val_idx: np.ndarray,
     strategy: str = "median",
 ) -> tuple[np.ndarray, np.ndarray, Pipeline]:
-    """Fit imputer + scaler on X.iloc[train_idx] only; transform both partitions.
+    """Fit on training positions only; transform train and validation."""
+    train = np.asarray(train_idx)
+    val = np.asarray(val_idx)
 
-    Raise if train_idx and val_idx overlap. Call again inside each inner
-    tuning split using only the outer-training rows.
-    """
-    if set(np.asarray(train_idx).tolist()) & set(np.asarray(val_idx).tolist()):
-        raise ValueError("Train and validation indices overlap.")
+    for name, positions in (("train", train), ("validation", val)):
+        if positions.ndim != 1 or not np.issubdtype(
+            positions.dtype, np.integer
+        ):
+            raise ValueError(
+                f"{name} indices must be a one-dimensional integer array"
+            )
+        if not len(positions) or len(np.unique(positions)) != len(positions):
+            raise ValueError(f"{name} indices must be nonempty and unique")
+        if (positions < 0).any() or (positions >= len(X)).any():
+            raise ValueError(f"{name} indices are out of range")
+
+    if np.intersect1d(train, val).size:
+        raise ValueError("Train and validation indices overlap")
+
+    if X.empty or not all(
+        pd.api.types.is_numeric_dtype(t) for t in X.dtypes
+    ):
+        raise ValueError("X must contain numeric model features only")
+
+    if np.isinf(X.to_numpy(dtype=float)).any():
+        raise ValueError("X contains infinite values")
+
     prep = make_fold_preprocessor(strategy)
-    X_train = prep.fit_transform(X.iloc[train_idx])
-    X_val = prep.transform(X.iloc[val_idx])
+    X_train = prep.fit_transform(X.iloc[train])
+    X_val = prep.transform(X.iloc[val])
+
+    if not np.isfinite(X_train).all() or not np.isfinite(X_val).all():
+        raise ValueError("Fold preprocessing produced nonfinite values")
+
     return X_train, X_val, prep
 
 
 # --------------------------------------------------------------------------
-# Input profiling (counts only; safe to share)
+# Private input profiling
 # --------------------------------------------------------------------------
-def profile_cognition_inputs(data_dir: Path, out_path: Path | None = None) -> dict:
-    """Summarize the raw cognition inputs without exposing any subject IDs.
+def profile_cognition_inputs(
+    data_dir: Path,
+    out_path: Path | None = None,
+) -> dict:
+    """Produce local QC counts; do not commit detailed profiles.
 
-    Self-contained on purpose (reads the CSVs itself), so it works while the
-    rest of this module is still stubs. Reports:
-      * rows / columns / unique IDs / max rows per ID, per file
-      * value counts of Subject Type, Sub Study Label, Visit, Administration
-        Type, Gender, Ethnicity
-      * per-column missingness, non-numeric strings (top 5), min/max, and
-        counts of common sentinel codes (-9, -99, -999, -9999, 999, 9999,
-        8888, 88888, 99999), and the 5 largest / smallest distinct values
-      * Enrolled Substudies: raw-string counts, token counts, and family
-        combinations (COBRE / BrainGluSchi / both)
-      * overlap: number of IDs in both neuropsych files, and how each file's
-        IDs split by enrollment family
-    Prints JSON and optionally writes it to `out_path`.
+    Omits IDs, raw free-text values, and individual score extremes.
+    Check the COINS agreement before sharing even aggregate counts.
     """
-    import json
+    cobre, bgs = load_raw_cognition(data_dir)
+    report: dict = {"files": {}, "overlap": {}}
 
-    categorical_cols = ["Subject Type", "Sub Study Label", "Visit",
-                        "Administration Type", "Gender", "Ethnicity"]
-    sentinels = [-9, -99, -999, -9999, 999, 9999, 8888, 88888, 99999]
+    for name, df in (("COBRE", cobre), ("BrainGluSchi", bgs)):
+        scores = df.drop(
+            columns=[column for column in METADATA_COLS if column in df],
+            errors="ignore",
+        )
 
-    def read_two_header(path: Path) -> pd.DataFrame:
-        # Only blank cells count as missing here, so strings like "N/A" or "NA"
-        # stay visible in the non-numeric report instead of being hidden.
-        return pd.read_csv(path, header=0, skiprows=[1],
-                           keep_default_na=False, na_values=[""])
+        repeated_ids = (
+            df[ID_COL]
+            .duplicated(keep=False)
+            .groupby(df[ID_COL])
+            .any()
+            .sum()
+        )
 
-    def value_counts(series: pd.Series) -> dict[str, int]:
-        return {str(k): int(v) for k, v in series.value_counts(dropna=False).items()}
-
-    def substudy_family(raw: object) -> str:
-        families = set()
-        for token in str(raw).split(","):
-            token = token.strip().lower()
-            if not token:
-                continue
-            if token.startswith("cobre"):
-                families.add("COBRE")
-            elif "braingluschi" in token:
-                families.add("BrainGluSchi")
-            else:
-                families.add(f"OTHER:{token}")
-        return "+".join(sorted(families)) or "NONE"
-
-    def profile_file(df: pd.DataFrame) -> dict:
-        return {
-            "n_rows": int(len(df)),
-            "n_columns": int(df.shape[1]),
-            "n_unique_ids": int(df[ID_COL].nunique()),
-            "max_rows_per_id": int(df[ID_COL].value_counts().max()),
-            "categorical": {c: value_counts(df[c]) for c in categorical_cols if c in df.columns},
+        report["files"][name] = {
+            "rows": len(df),
+            "columns": df.shape[1],
+            "unique_ids": int(df[ID_COL].nunique()),
+            "subjects_with_multiple_rows": int(repeated_ids),
+            "blank_cells_by_column": {
+                column: int(count)
+                for column, count in scores.isna().sum().items()
+            },
         }
 
-    def profile_columns(df: pd.DataFrame) -> dict:
-        out = {}
-        for col in df.columns:
-            if col == ID_COL or col in categorical_cols:
-                continue
-            raw = df[col]
-            num = pd.to_numeric(raw, errors="coerce")
-            nonnumeric = raw[num.isna() & raw.notna()].astype(str)
-            has_values = num.notna().any()
-            out[col] = {
-                "n_missing": int(raw.isna().sum()),
-                "n_nonnumeric": int(len(nonnumeric)),
-                "top_nonnumeric": {k: int(v) for k, v in nonnumeric.value_counts().head(5).items()},
-                "min": float(num.min()) if has_values else None,
-                "max": float(num.max()) if has_values else None,
-                "largest_values": {str(k): int(v) for k, v in
-                                   num.value_counts().sort_index(ascending=False).head(5).items()},
-                "smallest_values": {str(k): int(v) for k, v in
-                                    num.value_counts().sort_index().head(5).items()},
-                "sentinel_counts": {str(v): int((num == v).sum()) for v in sentinels if (num == v).any()},
-            }
-        return out
+    report["overlap"]["ids_in_both_cognition_files"] = len(
+        set(cobre[ID_COL]) & set(bgs[ID_COL])
+    )
 
-    def profile_enrollment(enroll: pd.DataFrame) -> dict:
-        col = "Enrolled Substudies"
-        tokens = (enroll[col].astype(str).str.split(",").explode().str.strip().str.lower())
-        return {
-            "n_rows": int(len(enroll)),
-            "n_unique_ids": int(enroll[ID_COL].nunique()),
-            "raw_string_counts": value_counts(enroll[col]),
-            "token_counts": value_counts(tokens),
-            "family_counts": value_counts(enroll[col].map(substudy_family)),
-        }
+    text = json.dumps(report, indent=2)
 
-    cobre = read_two_header(data_dir / "cobre_clinical" / COBRE_FILE)
-    bgs = read_two_header(data_dir / "braingluschi_clinical" / BGS_FILE)
-    enroll = pd.read_csv(data_dir / "cobre_clinical" / "enrollment_summary.csv")  # single header row
-
-    cobre_ids, bgs_ids = set(cobre[ID_COL]), set(bgs[ID_COL])
-    family_by_id = dict(zip(enroll[ID_COL], enroll["Enrolled Substudies"].map(substudy_family)))
-
-    def split_by_family(ids: set) -> dict[str, int]:
-        return value_counts(pd.Series([family_by_id.get(i, "NOT_IN_ENROLLMENT") for i in ids]))
-
-    report = {
-        "cobre": profile_file(cobre),
-        "braingluschi": profile_file(bgs),
-        "enrollment": profile_enrollment(enroll),
-        "overlap": {
-            "ids_in_both_neuropsych_files": len(cobre_ids & bgs_ids),
-            "cobre_file_ids_by_enrollment_family": split_by_family(cobre_ids),
-            "braingluschi_file_ids_by_enrollment_family": split_by_family(bgs_ids),
-        },
-        "columns": {"cobre": profile_columns(cobre), "braingluschi": profile_columns(bgs)},
-    }
-
-    text = json.dumps(report, indent=2, default=lambda o: o.item() if hasattr(o, "item") else str(o))
     if out_path is not None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(text)
+        out_path.write_text(text, encoding="utf-8")
+
     print(text)
     return report
 
@@ -663,27 +908,61 @@ def profile_cognition_inputs(data_dir: Path, out_path: Path | None = None) -> di
 # CLI
 # --------------------------------------------------------------------------
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Arguments: --data-dir, --out-dir, --dedup-policy, --profile, --profile-out."""
-    parser = argparse.ArgumentParser(description="Cognition preprocessing (COBRE + BrainGluSchi).")
-    parser.add_argument("--data-dir", type=Path, default=Path("data"),
-                        help="Folder containing cobre_clinical/ and braingluschi_clinical/")
-    parser.add_argument("--out-dir", type=Path, default=Path("data/features"))
-    parser.add_argument("--dedup-policy", default="fewest_missing",
-                        choices=["fewest_missing", "prefer_cobre", "prefer_braingluschi"])
-    parser.add_argument("--profile", action="store_true",
-                        help="Run profile_cognition_inputs (counts only) instead of the pipeline.")
-    parser.add_argument("--profile-out", type=Path, default=Path("results/cognition_profile.json"))
+    parser = argparse.ArgumentParser(
+        description="Preprocess COBRE and BrainGluSchi cognition."
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+        help="Contains cobre_clinical/ and braingluschi_clinical/.",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("data/features"),
+    )
+    parser.add_argument(
+        "--features",
+        type=Path,
+        default=None,
+        help="Defaults to DATA_DIR/whitelisted-features.csv.",
+    )
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="Optional private shared subject manifest.",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Run private input QC instead of exporting features.",
+    )
+    parser.add_argument(
+        "--profile-out",
+        type=Path,
+        default=Path("data/private/cognition_profile.json"),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Parse arguments and run build_cognition_table (or the profiler)."""
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
     args = parse_args(argv)
+
     if args.profile:
         profile_cognition_inputs(args.data_dir, args.profile_out)
     else:
-        build_cognition_table(args.data_dir, args.out_dir, args.dedup_policy)
+        build_cognition_table(
+            data_dir=args.data_dir,
+            out_dir=args.out_dir,
+            approved_features_path=args.features,
+            manifest_path=args.manifest,
+        )
 
 
 if __name__ == "__main__":
