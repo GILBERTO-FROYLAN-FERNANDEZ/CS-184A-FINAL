@@ -1,8 +1,17 @@
 """
 Preprocess cognitive assessment data from COBRE and BrainGluSchi.
 
-Select reviewed neuropsychological features, retain one assessment per
-subject, and export an unimputed, unscaled table for model training.
+This module reads the neuropsychological CSVs, validates subject IDs and
+reviewed feature names, retains one assessment per subject, and exports an
+unimputed, unscaled cognition table for downstream modeling and evaluation.
+
+The exported table is intentionally tabular-only:
+- no MRI processing
+- no scan-session selection
+- no cross-modal fusion
+- no global imputation or scaling
+
+Those responsibilities belong to other modules in the project.
 
 Flow (offline, no imputation or scaling):
     build_cognition_table
@@ -33,11 +42,17 @@ Flow (per CV fold, fit on training rows only):
 Separate utility (works on the raw files, private QC counts):
     profile_cognition_inputs
 
-Changes from the earlier version:
-- Uses the reviewed feature whitelist instead of automatic column selection.
-- Validates IDs and repeated visits, and supports a shared subject manifest.
-- Exports fixed-schema sentinel indicators aligned by subject ID.
-- Validates fold indices and keeps profiling output in a private location.
+Notes from the reviewed COBRE workbooks:
+- COBRE Data Dictionary maps the neuropsych columns to CNP codes and documents
+  Administration Type as CNP_105, which is excluded from model features.
+- COBRE Data Dictionary and COBRE INDI Additional data repeatedly document
+  codes such as 9999, DK, and MD across many instruments.
+- COBRE INDI Additional data also shows additional neuropsych fields beyond the
+  reviewed shared set (for example WASI/WAIS/CPT-II fields), so this module
+  uses an explicit whitelist instead of selecting all cognition-like columns.
+- COBRE_scan_key shows repeated MRI sessions and series names such as
+  mprage_5e, mprage_5e_RMS, RSTpre_V01_R01, dti_35dir, and GATE_V01_R01,
+  confirming that scan/session handling should remain outside cognition.py.
 """
 
 from __future__ import annotations
@@ -56,6 +71,10 @@ from sklearn.preprocessing import StandardScaler
 
 log = logging.getLogger(__name__)
 
+# --------------------------------------------------------------------------
+# Constants
+# --------------------------------------------------------------------------
+
 ID_COL = "Anonymized ID"
 STUDY_COL = "study"
 SOURCE_STUDY_COL = "source_study"
@@ -66,7 +85,7 @@ BGS_FILE = "2079_Neurospsych_20261123.csv"
 VALID_STUDIES = {"COBRE", "BrainGluSchi"}
 ID_PATTERN = re.compile(r"^A\d{8}$")
 
-# Additional safeguards; the whitelist, not this set, determines features.
+# Additional safeguards. The actual feature contract is the external whitelist.
 METADATA_COLS = {
     ID_COL,
     "Subject Type",
@@ -89,6 +108,12 @@ VISIT_ORDER_CANDIDATES = (
     "Days since enrollment",
 )
 
+# Reviewed numeric sentinel handling for the approved cognitive score columns.
+# 9999 is documented broadly in the COBRE dictionary as Not Applicable.
+# 8888 appears in uploaded workbook excerpts for some non-cognitive fields
+# (for example QOL money items as "Not applicable 8888"), so it is treated
+# conservatively as a non-valid numeric score if encountered in approved
+# cognition columns.
 MISSING_CODES = (9999,)
 UNRESOLVED_CODES = (8888,)
 
@@ -111,6 +136,7 @@ TEST_GROUP_PREFIXES = (
 
 
 def all_missing_codes() -> tuple[int, ...]:
+    """Return the reviewed numeric sentinel codes for approved score columns."""
     return MISSING_CODES + UNRESOLVED_CODES
 
 
@@ -118,7 +144,33 @@ def all_missing_codes() -> tuple[int, ...]:
 # Loading and subject IDs
 # --------------------------------------------------------------------------
 def validate_source_ids(df: pd.DataFrame, source: str) -> pd.DataFrame:
-    """Validate every ID before any visit selection can discard a row."""
+    """Validate and normalize subject IDs.
+
+    Parameters
+    ----------
+    df
+        DataFrame containing an Anonymized ID column.
+    source
+        Human-readable source name used in error messages.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of the input with stripped string IDs.
+
+    Raises
+    ------
+    KeyError
+        If the ID column is missing.
+    ValueError
+        If any ID is null, blank, or malformed.
+
+    Notes
+    -----
+    The uploaded scan-key workbook repeatedly shows subject IDs in the form
+    A00028303, A00014522, etc., which is consistent with the expected
+    A + 8 digits pattern enforced here.
+    """
     if ID_COL not in df.columns:
         raise KeyError(f"{source}: missing {ID_COL!r}")
 
@@ -137,7 +189,33 @@ def validate_source_ids(df: pd.DataFrame, source: str) -> pd.DataFrame:
 
 
 def load_clinical_csv(path: Path) -> pd.DataFrame:
-    """Read readable headers and skip the second, coded-header row."""
+    """Load a clinical CSV with a readable first header row and coded second row.
+
+    The neuropsych CSVs use:
+    - row 1: readable names
+    - row 2: coded names such as CNP_32
+
+    This function keeps only blank cells as missing. Unexpected strings like
+    DK or MD are preserved so numeric coercion can fail loudly if they appear
+    in approved score columns.
+
+    Parameters
+    ----------
+    path
+        CSV path.
+
+    Returns
+    -------
+    pd.DataFrame
+        Loaded and ID-validated table.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the file does not exist.
+    ValueError
+        If duplicate trimmed column names are detected.
+    """
     if not path.is_file():
         raise FileNotFoundError(path)
 
@@ -159,7 +237,24 @@ def load_clinical_csv(path: Path) -> pd.DataFrame:
 
 
 def load_raw_cognition(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load the two neuropsychological files."""
+    """Load the COBRE and BrainGluSchi raw neuropsych tables.
+
+    Parameters
+    ----------
+    data_dir
+        Directory containing cobre_clinical/ and braingluschi_clinical/.
+
+    Returns
+    -------
+    tuple[pd.DataFrame, pd.DataFrame]
+        (cobre, braingluschi)
+
+    Notes
+    -----
+    This function does not load MRI-related workbooks or files. The uploaded
+    COBRE scan key confirms that imaging sessions and series are tracked
+    separately and should not be mixed into cognition preprocessing.
+    """
     cobre = load_clinical_csv(data_dir / "cobre_clinical" / COBRE_FILE)
     bgs = load_clinical_csv(data_dir / "braingluschi_clinical" / BGS_FILE)
 
@@ -179,15 +274,44 @@ def load_raw_cognition(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
 # Reviewed feature whitelist
 # --------------------------------------------------------------------------
 def is_non_feature(column: str) -> bool:
-    """Check known metadata names; not a substitute for the whitelist."""
+    """Return True for known metadata/confound/label columns.
+
+    This is a safeguard only. The authoritative feature definition is the
+    external whitelist loaded by load_approved_features().
+    """
     return column in METADATA_COLS
 
 
 def load_approved_features(path: Path) -> list[str]:
-    """Load the reviewed score-column whitelist.
+    """Load the reviewed cognition feature whitelist.
 
-    The CSV must contain a 'feature' column with the approved names.
-    Additional columns (notes, groupings, ...) are ignored.
+    The file must contain a column named 'feature'. Additional columns are
+    ignored.
+
+    Parameters
+    ----------
+    path
+        Path to the whitelist CSV, e.g. data/whitelisted-features.csv.
+
+    Returns
+    -------
+    list[str]
+        Approved feature names in file order.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the whitelist file does not exist.
+    ValueError
+        If the whitelist is malformed, contains blanks, duplicates, metadata,
+        or the wrong number of features.
+
+    Notes
+    -----
+    The uploaded COBRE Data Dictionary and COBRE INDI Additional data show many
+    additional neuropsych or clinical variables beyond the 52 approved shared
+    columns. That is why this script uses an explicit whitelist rather than
+    inferring features from all available columns.
     """
     if not path.is_file():
         raise FileNotFoundError(f"Feature whitelist not found: {path}")
@@ -198,7 +322,6 @@ def load_approved_features(path: Path) -> list[str]:
         raise ValueError(f"{path}: must contain a 'feature' column")
 
     values = whitelist["feature"].str.strip()
-
     if values.isna().any() or values.eq("").any():
         raise ValueError(f"{path}: contains blank feature names")
 
@@ -209,8 +332,7 @@ def load_approved_features(path: Path) -> list[str]:
 
     if len(features) != EXPECTED_N_FEATURES:
         raise ValueError(
-            f"{path}: expected {EXPECTED_N_FEATURES} features, found "
-            f"{len(features)}"
+            f"{path}: expected {EXPECTED_N_FEATURES} features, found {len(features)}"
         )
 
     forbidden = [name for name in features if is_non_feature(name)]
@@ -227,13 +349,33 @@ def validate_approved_features(
     bgs: pd.DataFrame,
     features: list[str],
 ) -> None:
-    """Require every whitelisted feature to occur once in each file."""
-    for name, df in (("COBRE", cobre), ("BrainGluSchi", bgs)):
-        duplicates = df.columns[df.columns.duplicated()].tolist()
-        if duplicates:
-            raise ValueError(f"{name}: duplicate headers: {duplicates}")
+    """Validate that every approved feature exists in both cognition tables.
 
-        missing = [feature for feature in features if feature not in df]
+    Parameters
+    ----------
+    cobre, bgs
+        Raw cognition DataFrames.
+    features
+        Reviewed feature list.
+
+    Raises
+    ------
+    ValueError
+        If any approved feature is absent from either file.
+
+    Notes
+    -----
+    The uploaded COBRE dictionary excerpts include CNP mappings for the current
+    neuropsych score columns, such as:
+    - TMT_A_RawScore / TMT_A_T-Score
+    - HVLT scores
+    - BVMT scores
+    - CPT-IP scores
+    - MatricsDomain_* T-scores
+    and Administration Type as CNP_105, which remains excluded.
+    """
+    for name, df in (("COBRE", cobre), ("BrainGluSchi", bgs)):
+        missing = [feature for feature in features if feature not in df.columns]
         if missing:
             raise ValueError(
                 f"{name}: approved features absent from file: {missing}"
@@ -249,7 +391,13 @@ def validate_approved_features(
 # Visit selection and study rows
 # --------------------------------------------------------------------------
 def find_visit_order_column(df: pd.DataFrame) -> str | None:
-    """Return the available enrollment-day column, if any."""
+    """Return the enrollment-day column used to order repeated visits.
+
+    Returns
+    -------
+    str | None
+        First available column among VISIT_ORDER_CANDIDATES, or None.
+    """
     for column in VISIT_ORDER_CANDIDATES:
         if column in df.columns:
             return column
@@ -257,11 +405,31 @@ def find_visit_order_column(df: pd.DataFrame) -> str | None:
 
 
 def retain_first_visit(df: pd.DataFrame) -> pd.DataFrame:
-    """Keep the earliest recorded row per ID; refuse ambiguous repeats.
+    """Retain one cognition row per subject, choosing the earliest visit.
 
-    Subjects with a single row are passed through unchanged, even if their
-    visit-order value is missing or nonnumeric. Subjects with multiple rows
-    must have numeric, non-missing visit-order values and a unique minimum.
+    Subjects with a single row are passed through unchanged. Subjects with
+    multiple rows must have a usable numeric visit-order column.
+
+    Parameters
+    ----------
+    df
+        Source cognition table.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per subject.
+
+    Raises
+    ------
+    ValueError
+        If repeated subjects exist but visit ordering is ambiguous.
+
+    Notes
+    -----
+    The uploaded COBRE scan key clearly shows that some participants can have
+    multiple sessions on the imaging side. This function handles repeated rows
+    only within the cognition CSVs and does not attempt MRI session alignment.
     """
     if ID_COL not in df.columns:
         raise KeyError(f"Missing {ID_COL!r}")
@@ -279,27 +447,29 @@ def retain_first_visit(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["_visit_order"] = pd.to_numeric(out[order_column], errors="coerce")
 
-    if out.loc[repeated, "_visit_order"].isna().any():
+    repeated_rows = out.loc[repeated].copy()
+    unique_rows = out.loc[~repeated].copy()
+
+    if repeated_rows["_visit_order"].isna().any():
         raise ValueError(
             "Repeated subjects have missing or nonnumeric visit-order values"
         )
+    if np.isinf(repeated_rows["_visit_order"].to_numpy(dtype=float)).any():
+        raise ValueError(
+            "Repeated subjects have infinite visit-order values"
+        )
 
-    repeated_rows = out[repeated]
-    unique_rows = out[~repeated]
-
-    earliest_day = repeated_rows.groupby(ID_COL)["_visit_order"].transform(
-        "min"
-    )
+    earliest_day = repeated_rows.groupby(ID_COL)["_visit_order"].transform("min")
     earliest = repeated_rows.loc[
         repeated_rows["_visit_order"].eq(earliest_day)
-    ]
+    ].copy()
 
     if earliest[ID_COL].duplicated().any():
         raise ValueError(
-            "Some subjects have multiple rows tied for their earliest visit"
+            "Some repeated subjects have tied earliest visits"
         )
 
-    combined = pd.concat([unique_rows, earliest])
+    combined = pd.concat([unique_rows, earliest], axis=0).sort_index()
     dropped = len(df) - len(combined)
     if dropped:
         log.info(
@@ -308,7 +478,7 @@ def retain_first_visit(df: pd.DataFrame) -> pd.DataFrame:
             order_column,
         )
 
-    return combined.drop(columns="_visit_order").sort_index()
+    return combined.drop(columns="_visit_order")
 
 
 def prepare_study_table(
@@ -316,7 +486,22 @@ def prepare_study_table(
     source_study: str,
     feature_cols: list[str],
 ) -> pd.DataFrame:
-    """Select ID and scores from one source after visit selection."""
+    """Create a study-specific cognition table.
+
+    Parameters
+    ----------
+    df
+        Raw study table.
+    source_study
+        COBRE or BrainGluSchi.
+    feature_cols
+        Approved cognition feature names.
+
+    Returns
+    -------
+    pd.DataFrame
+        ID + approved features + source_study.
+    """
     if source_study not in VALID_STUDIES:
         raise ValueError(f"Unknown study: {source_study}")
 
@@ -330,13 +515,34 @@ def prepare_study_table(
 # Optional shared-manifest integration
 # --------------------------------------------------------------------------
 def load_cognition_manifest(path: Path) -> pd.DataFrame:
-    """Load a private manifest shared with the MRI pipelines.
+    """Load a shared manifest coordinating cognition with other modalities.
 
-    Required columns:
-      'Anonymized ID': one row per subject
-      'eligible': true/false or 1/0
-      'study': canonical study assignment
-      'cognition_source_study': clinical file supplying cognition scores
+    Required columns
+    ----------------
+    Anonymized ID
+        Unique subject ID.
+    eligible
+        Boolean-like indicator: true/false or 1/0.
+    study
+        Canonical study assignment.
+    cognition_source_study
+        Which cognition file supplies this subject's retained cognition row.
+
+    Parameters
+    ----------
+    path
+        Manifest CSV path.
+
+    Returns
+    -------
+    pd.DataFrame
+        Validated manifest.
+
+    Notes
+    -----
+    This module does not build the manifest itself. If omitted, cognition.py
+    exports all cognition rows and warns that cohort eligibility and canonical
+    study must be enforced elsewhere.
     """
     required = {ID_COL, "eligible", STUDY_COL, "cognition_source_study"}
 
@@ -350,9 +556,7 @@ def load_cognition_manifest(path: Path) -> pd.DataFrame:
     if manifest[ID_COL].duplicated().any():
         raise ValueError("Manifest contains duplicate subject IDs")
 
-    eligibility = (
-        manifest["eligible"].astype("string").str.strip().str.lower()
-    )
+    eligibility = manifest["eligible"].astype("string").str.strip().str.lower()
     mapping = {"true": True, "false": False, "1": True, "0": False}
 
     if not eligibility.isin(mapping).all():
@@ -361,8 +565,8 @@ def load_cognition_manifest(path: Path) -> pd.DataFrame:
         )
 
     manifest["eligible"] = eligibility.map(mapping).astype(bool)
-    eligible = manifest.loc[manifest["eligible"]]
 
+    eligible = manifest.loc[manifest["eligible"]]
     for column in (STUDY_COL, "cognition_source_study"):
         if eligible[column].isna().any():
             raise ValueError(f"Eligible subjects have missing {column}")
@@ -376,7 +580,20 @@ def select_manifest_cognition_rows(
     stacked: pd.DataFrame,
     manifest: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Select eligible rows from the source specified by the shared manifest."""
+    """Filter stacked cognition rows according to a shared manifest.
+
+    Parameters
+    ----------
+    stacked
+        Combined COBRE + BrainGluSchi cognition rows with source_study.
+    manifest
+        Shared subject manifest.
+
+    Returns
+    -------
+    pd.DataFrame
+        Eligible cognition rows with canonical study assignment.
+    """
     if stacked.duplicated([ID_COL, SOURCE_STUDY_COL]).any():
         raise ValueError("Duplicate cognition rows within a source study")
 
@@ -391,27 +608,24 @@ def select_manifest_cognition_rows(
     absent = joined["_merge"].eq("left_only")
     if absent.any():
         raise ValueError(
-            f"{joined.loc[absent, ID_COL].nunique()} cognition IDs "
-            "are absent from the manifest"
+            f"{joined.loc[absent, ID_COL].nunique()} cognition IDs are absent from the manifest"
         )
 
     joined = joined.drop(columns="_merge")
+
     selected = joined.loc[
         joined["eligible"]
         & joined[SOURCE_STUDY_COL].eq(joined["cognition_source_study"])
     ].copy()
 
     if selected[ID_COL].duplicated().any():
-        raise ValueError(
-            "Manifest selection produced duplicate cognition IDs"
-        )
+        raise ValueError("Manifest selection produced duplicate cognition IDs")
 
     expected = set(manifest.loc[manifest["eligible"], ID_COL])
     unavailable = expected - set(selected[ID_COL])
     if unavailable:
         log.warning(
-            "%d eligible manifest subjects have no cognition row in "
-            "their designated source",
+            "%d eligible manifest subjects have no cognition row in their designated source",
             len(unavailable),
         )
 
@@ -428,11 +642,27 @@ def merge_studies(
     feature_cols: list[str],
     manifest: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Stack cognition rows, using a manifest if one is supplied.
+    """Merge COBRE and BrainGluSchi cognition rows.
 
-    Without a manifest, source study is used provisionally as canonical
-    study. That is acceptable for exporting cognition but does not
-    establish cross-modal eligibility or canonical study assignment.
+    Parameters
+    ----------
+    cobre, bgs
+        Raw cognition tables.
+    feature_cols
+        Approved cognition features.
+    manifest
+        Optional shared manifest for subject selection.
+
+    Returns
+    -------
+    pd.DataFrame
+        Subject-level cognition table.
+
+    Notes
+    -----
+    Without a manifest, source_study is copied to study and all cognition rows
+    are exported. That is acceptable for preprocessing output but not sufficient
+    to define the final multimodal cohort.
     """
     stacked = pd.concat(
         [
@@ -447,13 +677,13 @@ def merge_studies(
 
     if stacked[ID_COL].duplicated().any():
         raise ValueError(
-            "An ID occurs in both cognition files. Supply a shared "
-            "--manifest; cognition.py must not choose a source independently."
+            "An ID occurs in both cognition files. Supply a shared --manifest; "
+            "cognition.py must not choose a source independently."
         )
 
     log.warning(
-        "No manifest supplied: exporting all cognition subjects. Cohort "
-        "eligibility and canonical study must be checked downstream."
+        "No manifest supplied: exporting all cognition subjects. "
+        "Cohort eligibility and canonical study must be checked downstream."
     )
 
     stacked[STUDY_COL] = stacked[SOURCE_STUDY_COL]
@@ -461,13 +691,37 @@ def merge_studies(
 
 
 # --------------------------------------------------------------------------
-# Numeric values and sentinel codes
+# Numeric conversion and sentinel handling
 # --------------------------------------------------------------------------
 def coerce_features_numeric(
     df: pd.DataFrame,
     feature_cols: list[str],
 ) -> pd.DataFrame:
-    """Convert reviewed score columns to numbers; reject unexpected text."""
+    """Convert approved feature columns to numeric.
+
+    Parameters
+    ----------
+    df
+        Cognition table.
+    feature_cols
+        Approved score columns.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy with numeric feature columns.
+
+    Raises
+    ------
+    ValueError
+        If unexpected nonnumeric values or infinities are found.
+
+    Notes
+    -----
+    The uploaded COBRE dictionary documents textual codes like DK and MD in
+    many instruments. If those appear in approved numeric cognition columns,
+    this function fails explicitly rather than silently coercing them away.
+    """
     out = df.copy()
 
     for column in feature_cols:
@@ -476,12 +730,10 @@ def coerce_features_numeric(
 
         unexpected = raw.notna() & converted.isna()
         if unexpected.any():
-            examples = (
-                raw.loc[unexpected].astype(str).unique()[:3].tolist()
-            )
+            examples = raw.loc[unexpected].astype(str).unique()[:3].tolist()
             raise ValueError(
                 f"{column}: {int(unexpected.sum())} unexpected nonnumeric "
-                f"values (e.g. {examples}); review the source data locally"
+                f"values (e.g. {examples})"
             )
 
         converted = converted.astype(float)
@@ -494,7 +746,23 @@ def coerce_features_numeric(
 
 
 def group_of(column: str) -> str:
-    """Return a fixed test-group name for an approved score column."""
+    """Map an approved feature to its indicator test group.
+
+    Parameters
+    ----------
+    column
+        Approved feature name.
+
+    Returns
+    -------
+    str
+        Indicator group name.
+
+    Raises
+    ------
+    ValueError
+        If the feature is not mapped.
+    """
     if column.startswith("MatricsDomain_"):
         return column.removesuffix("_T-Score")
 
@@ -511,34 +779,60 @@ def make_code_indicators(
     df: pd.DataFrame,
     feature_cols: list[str],
 ) -> pd.DataFrame:
-    """Return ID-keyed sentinel flags with a schema independent of values.
+    """Create fixed-schema sentinel indicators keyed by subject ID.
 
-    Compute on original numeric scores, before sentinel replacement.
-    Build via a dict of arrays so the DataFrame is constructed in a
-    single step and does not trigger pandas fragmentation.
+    Parameters
+    ----------
+    df
+        Cognition table with original numeric values still present.
+    feature_cols
+        Approved cognition score columns.
+
+    Returns
+    -------
+    pd.DataFrame
+        ID + binary indicator columns for each group x sentinel-code pair.
+
+    Notes
+    -----
+    The schema is fixed regardless of whether a given flag is all zero in the
+    current dataset. This makes downstream joins and testing more stable.
     """
     groups: dict[str, list[str]] = {}
     for column in feature_cols:
         groups.setdefault(group_of(column), []).append(column)
 
-    flag_arrays: dict[str, np.ndarray] = {}
-    for group, columns in groups.items():
+    arrays: dict[str, np.ndarray] = {}
+    for group, cols in groups.items():
         for code in all_missing_codes():
             name = f"{group}__code{code}"
-            flag_arrays[name] = (
-                df[columns].eq(code).any(axis=1).to_numpy().astype("int8")
+            arrays[name] = (
+                df[cols].eq(code).any(axis=1).to_numpy().astype("int8")
             )
 
-    flags = pd.DataFrame(flag_arrays)
-    flags.insert(0, ID_COL, df[ID_COL].to_numpy())
-    return flags
+    indicators = pd.DataFrame(arrays)
+    indicators.insert(0, ID_COL, df[ID_COL].to_numpy())
+    return indicators
 
 
 def log_code_indicator_rates(
     indicators: pd.DataFrame,
     study: pd.Series,
 ) -> pd.DataFrame:
-    """Log per-study rates; return the full (possibly sparse) rate table."""
+    """Log per-study prevalence of sentinel indicators.
+
+    Parameters
+    ----------
+    indicators
+        Indicator table returned by make_code_indicators().
+    study
+        Canonical study labels aligned row-wise with indicators.
+
+    Returns
+    -------
+    pd.DataFrame
+        Percent prevalence by study for all indicator columns.
+    """
     flag_columns = indicators.columns.drop(ID_COL)
     rates = (
         indicators[flag_columns]
@@ -565,7 +859,27 @@ def replace_missing_codes(
     feature_cols: list[str],
     codes: tuple[int, ...] | None = None,
 ) -> pd.DataFrame:
-    """Replace approved sentinel codes with NaN in score columns only."""
+    """Replace reviewed numeric sentinel codes with NaN.
+
+    Parameters
+    ----------
+    df
+        Cognition table.
+    feature_cols
+        Approved score columns.
+    codes
+        Optional override; defaults to reviewed missing-code tuple.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy with sentinel values replaced by NaN.
+
+    Notes
+    -----
+    This replacement happens after indicator creation so that the original
+    distinction between 9999 and 8888 is preserved in cognition_indicators.csv.
+    """
     codes = all_missing_codes() if codes is None else codes
     out = df.copy()
 
@@ -582,6 +896,7 @@ def replace_missing_codes(
             .astype(int)
             .to_dict()
         )
+
         log.info(
             "Code %s: %d cells; subjects affected by study: %s",
             code,
@@ -600,7 +915,13 @@ def summarize_missingness(
     df: pd.DataFrame,
     feature_cols: list[str],
 ) -> dict[str, pd.DataFrame | pd.Series]:
-    """Descriptive summaries; do not modify the input."""
+    """Summarize post-replacement missingness.
+
+    Returns
+    -------
+    dict[str, pd.DataFrame | pd.Series]
+        per_feature, per_subject, per_study summaries.
+    """
     missing = df[feature_cols].isna()
 
     per_feature = pd.DataFrame(
@@ -622,7 +943,22 @@ def flag_unusable_features(
     feature_cols: list[str],
     max_missing_pct: float = 50.0,
 ) -> list[str]:
-    """Report features to investigate; do not select or drop them here."""
+    """Report features needing manual review.
+
+    Parameters
+    ----------
+    df
+        Cognition table.
+    feature_cols
+        Approved features.
+    max_missing_pct
+        Threshold for warning on high missingness.
+
+    Returns
+    -------
+    list[str]
+        Features that are constant or exceed the missingness threshold.
+    """
     flagged = [
         column
         for column in feature_cols
@@ -642,11 +978,25 @@ def validate_cognition_table(
     df: pd.DataFrame,
     feature_cols: list[str],
 ) -> None:
-    """Validate the unimputed, unscaled subject-level score table."""
+    """Validate the final unimputed, unscaled cognition table.
+
+    Checks
+    ------
+    - non-empty output
+    - approved feature presence
+    - required study/source columns
+    - valid subject IDs
+    - no duplicate IDs
+    - valid study/source labels
+    - numeric features only
+    - no infinities
+    - no remaining sentinel codes
+    - no entirely missing features
+    """
     if df.empty:
         raise ValueError("Cognition table is empty")
 
-    missing = [column for column in feature_cols if column not in df]
+    missing = [column for column in feature_cols if column not in df.columns]
     if missing:
         raise KeyError(f"Missing approved features: {missing}")
 
@@ -667,17 +1017,14 @@ def validate_cognition_table(
 
     nonnumeric = df[feature_cols].select_dtypes(exclude="number").columns
     if len(nonnumeric):
-        raise TypeError(
-            f"Nonnumeric cognitive features remain: {list(nonnumeric)}"
-        )
+        raise TypeError(f"Nonnumeric cognitive features remain: {list(nonnumeric)}")
 
     values = df[feature_cols].to_numpy(dtype=float)
     if np.isinf(values).any():
         raise ValueError("Infinite cognitive values remain")
 
     remaining_codes = [
-        column
-        for column in feature_cols
+        column for column in feature_cols
         if df[column].isin(all_missing_codes()).any()
     ]
     if remaining_codes:
@@ -687,9 +1034,7 @@ def validate_cognition_table(
         column for column in feature_cols if df[column].isna().all()
     ]
     if all_missing:
-        raise ValueError(
-            f"Entirely missing cognitive features: {all_missing}"
-        )
+        raise ValueError(f"Entirely missing cognitive features: {all_missing}")
 
     log.info(
         "Validation passed: %d subjects x %d features",
@@ -704,14 +1049,34 @@ def export_cognition_table(
     out_dir: Path,
     indicators: pd.DataFrame,
 ) -> None:
-    """Export private, ID-keyed feature tables; never export labels here."""
+    """Export cognition preprocessing outputs.
+
+    Files written
+    -------------
+    cognition.csv
+        ID + approved cognition scores.
+    cognition_study.csv
+        ID + canonical study + source_study.
+    cognition_features.csv
+        The approved feature list used for this run.
+    cognition_indicators.csv
+        ID + fixed-schema sentinel indicators.
+    cognition_missingness.csv
+        Written separately by build_cognition_table().
+
+    Notes
+    -----
+    No labels, demographics, or MRI/session fields are exported here.
+    """
     if indicators[ID_COL].duplicated().any():
         raise ValueError("Duplicate IDs in indicator table")
 
     if set(indicators[ID_COL]) != set(df[ID_COL]):
-        raise ValueError(
-            "Indicator IDs do not match cognition table IDs"
-        )
+        raise ValueError("Indicator IDs do not match cognition table IDs")
+
+    flag_columns = indicators.columns.drop(ID_COL)
+    if not indicators[flag_columns].isin([0, 1]).all().all():
+        raise ValueError("Indicators must be binary 0/1 values")
 
     flags = df[[ID_COL]].merge(
         indicators,
@@ -720,15 +1085,12 @@ def export_cognition_table(
         validate="one_to_one",
     )
 
-    flag_columns = flags.columns.drop(ID_COL)
     if flags[flag_columns].isna().any().any():
         raise ValueError("Indicator alignment introduced missing flags")
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    df[[ID_COL] + feature_cols].to_csv(
-        out_dir / "cognition.csv", index=False
-    )
+    df[[ID_COL] + feature_cols].to_csv(out_dir / "cognition.csv", index=False)
     df[[ID_COL, STUDY_COL, SOURCE_STUDY_COL]].to_csv(
         out_dir / "cognition_study.csv", index=False
     )
@@ -749,7 +1111,29 @@ def build_cognition_table(
     approved_features_path: Path | None = None,
     manifest_path: Path | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
-    """Build and export approved cognitive scores without fitting a model."""
+    """Build the final unimputed, unscaled cognition table.
+
+    Parameters
+    ----------
+    data_dir
+        Root data directory.
+    out_dir
+        Output directory for exported cognition files.
+    approved_features_path
+        Optional whitelist CSV path. Defaults to data_dir/whitelisted-features.csv.
+    manifest_path
+        Optional shared manifest path.
+
+    Returns
+    -------
+    tuple[pd.DataFrame, list[str]]
+        Final cognition table and approved feature list.
+
+    Notes
+    -----
+    This function intentionally does not produce a globally imputed or scaled
+    table. Imputation and scaling must be fitted inside each training fold.
+    """
     if approved_features_path is None:
         approved_features_path = data_dir / "whitelisted-features.csv"
 
@@ -784,8 +1168,8 @@ def build_cognition_table(
 
     flag_unusable_features(table, feature_cols)
     validate_cognition_table(table, feature_cols)
-
     export_cognition_table(table, feature_cols, out_dir, indicators)
+
     missingness["per_feature"].to_csv(out_dir / "cognition_missingness.csv")
 
     return table, feature_cols
@@ -795,7 +1179,23 @@ def build_cognition_table(
 # Fold-level preprocessing
 # --------------------------------------------------------------------------
 def make_fold_preprocessor(strategy: str = "median") -> Pipeline:
-    """Return a new, unfitted preprocessing pipeline for one fold."""
+    """Create a fresh imputer+scaler pipeline for one fold.
+
+    Parameters
+    ----------
+    strategy
+        Imputation strategy for sklearn SimpleImputer.
+
+    Returns
+    -------
+    Pipeline
+        Unfitted sklearn pipeline.
+
+    Notes
+    -----
+    This is used inside cross-validation only. The offline exports remain
+    unimputed and unscaled by design.
+    """
     return Pipeline(
         [
             (
@@ -813,17 +1213,38 @@ def transform_fold(
     val_idx: np.ndarray,
     strategy: str = "median",
 ) -> tuple[np.ndarray, np.ndarray, Pipeline]:
-    """Fit on training positions only; transform train and validation."""
+    """Fit preprocessing on training rows only and transform both splits.
+
+    Parameters
+    ----------
+    X
+        Numeric feature matrix.
+    train_idx, val_idx
+        Positional row indices for train and validation partitions.
+    strategy
+        Imputation strategy.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray, Pipeline]
+        Transformed train array, transformed validation array, fitted pipeline.
+
+    Raises
+    ------
+    ValueError
+        If indices are invalid or output contains nonfinite values.
+
+    Notes
+    -----
+    This function exists so evaluation can avoid leakage. It should be called
+    inside each outer and inner CV split as needed.
+    """
     train = np.asarray(train_idx)
     val = np.asarray(val_idx)
 
     for name, positions in (("train", train), ("validation", val)):
-        if positions.ndim != 1 or not np.issubdtype(
-            positions.dtype, np.integer
-        ):
-            raise ValueError(
-                f"{name} indices must be a one-dimensional integer array"
-            )
+        if positions.ndim != 1 or not np.issubdtype(positions.dtype, np.integer):
+            raise ValueError(f"{name} indices must be a one-dimensional integer array")
         if not len(positions) or len(np.unique(positions)) != len(positions):
             raise ValueError(f"{name} indices must be nonempty and unique")
         if (positions < 0).any() or (positions >= len(X)).any():
@@ -832,9 +1253,7 @@ def transform_fold(
     if np.intersect1d(train, val).size:
         raise ValueError("Train and validation indices overlap")
 
-    if X.empty or not all(
-        pd.api.types.is_numeric_dtype(t) for t in X.dtypes
-    ):
+    if X.empty or not all(pd.api.types.is_numeric_dtype(t) for t in X.dtypes):
         raise ValueError("X must contain numeric model features only")
 
     if np.isinf(X.to_numpy(dtype=float)).any():
@@ -857,17 +1276,36 @@ def profile_cognition_inputs(
     data_dir: Path,
     out_path: Path | None = None,
 ) -> dict:
-    """Produce local QC counts; do not commit detailed profiles.
+    """Generate private QC counts for the raw cognition inputs.
 
-    Omits IDs, raw free-text values, and individual score extremes.
-    Check the COINS agreement before sharing even aggregate counts.
+    Parameters
+    ----------
+    data_dir
+        Root data directory.
+    out_path
+        Optional private JSON output path.
+
+    Returns
+    -------
+    dict
+        Aggregate QC report.
+
+    Notes
+    -----
+    This utility is intentionally conservative:
+    - no subject-level rows
+    - no raw free-text dumps
+    - no MRI/session joins
+
+    Even aggregate outputs should be treated as private under the data-use
+    agreement unless explicitly approved for sharing.
     """
     cobre, bgs = load_raw_cognition(data_dir)
     report: dict = {"files": {}, "overlap": {}}
 
     for name, df in (("COBRE", cobre), ("BrainGluSchi", bgs)):
         scores = df.drop(
-            columns=[column for column in METADATA_COLS if column in df],
+            columns=[column for column in METADATA_COLS if column in df.columns],
             errors="ignore",
         )
 
@@ -908,6 +1346,7 @@ def profile_cognition_inputs(
 # CLI
 # --------------------------------------------------------------------------
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments for cognition preprocessing."""
     parser = argparse.ArgumentParser(
         description="Preprocess COBRE and BrainGluSchi cognition."
     )
@@ -921,37 +1360,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--out-dir",
         type=Path,
         default=Path("data/features"),
+        help="Output directory for exported cognition tables.",
     )
     parser.add_argument(
         "--features",
         type=Path,
         default=None,
-        help="Defaults to DATA_DIR/whitelisted-features.csv.",
+        help="Optional whitelist CSV. Defaults to DATA_DIR/whitelisted-features.csv.",
     )
     parser.add_argument(
         "--manifest",
         type=Path,
         default=None,
-        help="Optional private shared subject manifest.",
+        help="Optional shared subject manifest.",
     )
     parser.add_argument(
         "--profile",
         action="store_true",
-        help="Run private input QC instead of exporting features.",
+        help="Run private QC profiling instead of exporting cognition tables.",
     )
     parser.add_argument(
         "--profile-out",
         type=Path,
         default=Path("data/private/cognition_profile.json"),
+        help="Private QC JSON output path.",
     )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(levelname)s: %(message)s",
-    )
+    """Run the cognition preprocessing CLI."""
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args(argv)
 
     if args.profile:
