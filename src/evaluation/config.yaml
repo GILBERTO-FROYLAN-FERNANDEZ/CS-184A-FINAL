@@ -1,0 +1,129 @@
+# Evaluation configuration for src/evaluation/evaluation.py
+#
+# Tags:
+#   FIXED     taken from the project plan
+#   PROPOSED  my suggestion; confirm with the team before running
+#   TODO      undecided or not yet available
+#
+# Everything here is private-project configuration; it contains no subject data.
+
+# --- Inputs ------------------------------------------------------------------
+# No manifest file. evaluation.py builds the subject table in memory
+# (build_subject_table) from the raw demographics/enrollment files below plus
+# membership in the feature tables. Import that one function everywhere so
+# cohort rules cannot drift between modules.
+subjects:
+  demographics:                # raw clinical files: label source and age/sex confounds
+    COBRE: data/cobre_clinical/1139_Demographics_20261123.csv
+    BrainGluSchi: data/braingluschi_clinical/2079_Demographics_20261123.csv
+  enrollment_summary: data/cobre_clinical/enrollment_summary.csv
+  canonical_study: enrollment_summary    # TODO confirm; fallback is cognition_study.csv
+  label_map:                   # FIXED, from the Data Guide
+    control: [Control, Old Control, Young Control]
+    schizophrenia: [Schizophrenia, Chronic Sz, Early Sz]
+  exclude_subject_types: [Bipolar, Schizoaffective]   # FIXED (21 people)
+  early_subject_type: Early Sz                        # FIXED
+  availability: from_feature_tables    # a modality is available if the person has a row
+  qc:
+    fmri_max_mean_fd_mm: 0.5           # FIXED
+
+features:                      # produced by the preprocessing modules
+  cognition: data/features/cognition.csv
+  structure: data/features/structure.csv
+  connectivity: data/features/connectivity
+cognition_study: data/features/cognition_study.csv          # source file per person
+cognition_features: data/features/cognition_features.csv    # feature names used in this run
+cognition_missingness: data/features/cognition_missingness.csv   # aggregate QC report only
+cognition_whitelist: data/whitelisted-features.csv   # exists; the 52 approved cognition features (also read by cognition.py)
+cognition_indicators: data/features/cognition_indicators.csv   # sentinel flags (confound check only)
+
+confounds:                     # TODO: confirm file names and who produces them
+  # age, sex, education: read from subjects.demographics above (never model features)
+  motion: data/features/motion.csv               # mean framewise displacement, from fMRI QC
+  medication: data/features/medication.csv       # patients only
+  illness_duration: data/features/illness_duration.csv   # patients only
+
+# --- Outputs -----------------------------------------------------------------
+results_dir: results           # reviewed aggregates only; no subject IDs
+private_dir: data/private      # splits, predictions, audit record (git-ignored)
+
+# --- Splits ------------------------------------------------------------------
+seeds: [0, 1, 2]               # FIXED count (3); PROPOSED values
+n_folds: 5                     # FIXED
+stratify_by: [label, study]    # FIXED: person-level, balanced by label and study where feasible
+
+# --- Metrics and statistics ---------------------------------------------------
+metrics:
+  primary: roc_auc             # FIXED
+  secondary: [balanced_accuracy, f1]   # FIXED
+threshold:
+  rule: youden_on_training_predictions # TODO: choose; must use training-fold predictions only
+bootstrap:
+  n_resamples: 1000            # FIXED
+  ci_level: 0.95               # FIXED
+  resample_unit: person        # FIXED
+permutation:
+  n_permutations: 10000        # PROPOSED
+  paired: true                 # FIXED
+multiple_comparisons:
+  method: holm                 # PROPOSED
+  family: confirmatory         # only comparisons with confirmatory: true
+
+# --- Safeguards --------------------------------------------------------------
+shuffled_label_gate:
+  enabled: true                # PROPOSED: gate for every model class, tuning included
+  n_repeats: 3                 # PROPOSED
+  max_mean_auc: 0.55           # PROPOSED: halt if the mean exceeds this
+cross_study:                   # FIXED: both directions, no person on both sides
+  directions:
+    - {train: COBRE, test: BrainGluSchi}
+    - {train: BrainGluSchi, test: COBRE}
+early_illness:
+  subject_type: Early Sz       # FIXED
+  early_control_group: BrainGluSchi   # TODO: BrainGluSchi controls only, or all controls?
+early_control_group: BrainGluSchi     # read by run_evaluation; keep equal to the line above
+interpretation:
+  methods: [permutation_importance, shap]   # FIXED: not attention weights
+
+# --- Model families -----------------------------------------------------------
+# One tuning budget per model class, shared by every comparison that uses it, so
+# baseline and candidate always get matched effort.
+models:
+  logistic_regression:
+    tuning_budget: {inner_folds: 5, n_trials: 30}     # PROPOSED
+  xgboost:
+    tuning_budget: {inner_folds: 5, n_trials: 30}     # PROPOSED
+  ft_transformer:
+    tuning_budget: {inner_folds: 3, n_trials: 15}     # PROPOSED; compact (2-3 layers, dim 32-64) per plan
+  brain_network_transformer:
+    tuning_budget: {inner_folds: 3, n_trials: 15}     # PROPOSED
+
+# --- Comparisons --------------------------------------------------------------
+# Each pair differs only in modalities. `modalities` at the top level is the union
+# required to freeze the cohort. Add `predictions: <path>` to a spec to use
+# held-out-prediction mode instead of a training callback.
+comparisons:
+  - name: cognition_vs_cognition_smri
+    confirmatory: true         # TODO: confirm the family with the team
+    modalities: [cognition, structure]
+    baseline:  {name: lr_cognition,      model: logistic_regression, modalities: [cognition]}
+    candidate: {name: lr_cognition_smri, model: logistic_regression, modalities: [cognition, structure]}
+
+  - name: cognition_vs_cognition_fmri
+    confirmatory: true
+    modalities: [cognition, connectivity]
+    baseline:  {name: lr_cognition,      model: logistic_regression, modalities: [cognition]}
+    candidate: {name: lr_cognition_fmri, model: logistic_regression, modalities: [cognition, connectivity]}
+
+  - name: cognition_vs_all_modalities
+    confirmatory: true
+    modalities: [cognition, structure, connectivity]
+    baseline:  {name: lr_cognition,     model: logistic_regression, modalities: [cognition]}
+    candidate: {name: lr_all,           model: logistic_regression, modalities: [cognition, structure, connectivity]}
+
+  # Example exploratory entry (not Holm-corrected): late fusion of unimodal models.
+  # - name: cognition_vs_late_fusion
+  #   confirmatory: false
+  #   modalities: [cognition, structure, connectivity]
+  #   baseline:  {name: lr_cognition, model: logistic_regression, modalities: [cognition]}
+  #   candidate: {name: late_fusion,  model: late_fusion, modalities: [cognition, structure, connectivity]}
